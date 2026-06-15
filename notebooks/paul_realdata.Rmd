@@ -1,0 +1,356 @@
+---
+title: "Paul et al. 2015 bone-marrow benchmark"
+output: html_notebook
+---
+
+Real-data follow-up requested in the article's Discussion: compare
+`rmagic_auto`, `cv_mcv`, and `cv_per_module` on the Paul et al. 2015
+mouse bone-marrow dataset (GEO **GSE72857**), the dataset used in the
+original MAGIC paper's downstream validation.
+
+We report two of the three metrics named in the Discussion:
+
+1. **Cluster preservation.** Adjusted Rand Index between Louvain
+   clusters on the imputed matrix and Louvain clusters on the raw data.
+2. **Transcription-factor target prediction AUC.** For each method,
+   treat known hematopoietic TF-target pairs as positives and random
+   TF-non-target pairs as negatives; score each pair by the magnitude
+   of its Spearman correlation in the imputed expression matrix;
+   compute ROC AUC.
+
+The third metric named in the article, FACS-protein correlation, is
+**not applicable**: Paul 2015 used a SMART-seq protocol with no paired
+FACS protein measurements per cell.
+
+```{r setup, message=FALSE}
+suppressPackageStartupMessages({
+  library(cvMAGIC)
+  library(Rmagic)
+  library(Matrix)
+  library(Seurat)
+  library(mclust)              # adjustedRandIndex
+  library(pROC)                # ROC AUC
+  library(ggplot2)
+  library(dplyr)
+  library(patchwork)
+})
+stopifnot(Rmagic::pymagic_is_available())
+
+fig_dir <- normalizePath(file.path("..", "figures"), mustWork = FALSE)
+data_dir <- normalizePath(file.path("..", "data"), mustWork = FALSE)
+dir.create(fig_dir,  showWarnings = FALSE, recursive = TRUE)
+dir.create(data_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Download (once)
+
+```{r download, message=FALSE}
+url      <- "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE72nnn/GSE72857/suppl/GSE72857_umitab.txt.gz"
+gz_path  <- file.path(data_dir, "GSE72857_umitab.txt.gz")
+txt_path <- file.path(data_dir, "GSE72857_umitab.txt")
+
+if (!file.exists(gz_path)) {
+  options(timeout = 600)
+  utils::download.file(url, gz_path, mode = "wb", quiet = TRUE)
+}
+if (!file.exists(txt_path)) {
+  R.utils::gunzip(gz_path, destname = txt_path, remove = FALSE)
+}
+
+cat("File size on disk:", file.info(txt_path)$size, "bytes\n")
+```
+
+## Load, subsample, filter
+
+The full table is ~27 k genes x ~10 k cells. We subsample cells and pick
+high-variance genes to keep the notebook tractable. The subset is large
+enough that the methods can differ; running on the full table is a
+matter of changing `n_cells_keep` and `n_genes_keep`.
+
+```{r load, message=FALSE}
+counts_full <- data.table::fread(txt_path, sep = "\t",
+                                 header = TRUE, data.table = FALSE)
+gene_names <- counts_full[[1]]
+counts_full <- as.matrix(counts_full[, -1, drop = FALSE])
+rownames(counts_full) <- gene_names
+dim(counts_full)                  # genes x cells
+
+# Drop cells with very low or very high library size.
+libsize <- colSums(counts_full)
+keep_cell <- libsize >= 500 & libsize <= quantile(libsize, 0.99)
+cat("Cells passing libsize filter:", sum(keep_cell), "/", length(keep_cell), "\n")
+
+# Subsample cells.
+set.seed(101L)
+n_cells_keep <- 1500L
+cell_idx <- sample(which(keep_cell), min(n_cells_keep, sum(keep_cell)))
+cnts <- counts_full[, cell_idx, drop = FALSE]
+
+# Filter to genes expressed in >= 5% of cells, then top high-variance.
+gene_pos_frac <- rowMeans(cnts > 0)
+cnts <- cnts[gene_pos_frac >= 0.05, , drop = FALSE]
+gene_var <- apply(cnts, 1, var)
+n_genes_keep <- 2000L
+gene_idx <- order(gene_var, decreasing = TRUE)[seq_len(
+  min(n_genes_keep, length(gene_var)))]
+cnts <- cnts[gene_idx, , drop = FALSE]
+
+# Transpose to cells x genes (cvMAGIC convention).
+X <- t(cnts)
+storage.mode(X) <- "integer"
+dim(X)
+```
+
+## Run the three methods
+
+```{r impute, message=FALSE}
+NPCA <- 20L; K <- 30L
+
+t_start <- Sys.time()
+
+# cv_mcv: MCV-tuned t.
+sel_mcv <- mcv_select_t(X, t_values = 1:10,
+                        npca = NPCA, k = K, seed = 1L)
+g_full  <- magic_graph(X, npca = NPCA, k = K)
+imp_cv_mcv <- magic_impute(X, t = sel_mcv$t, graph = g_full)
+cat(sprintf("cv_mcv         t = %d  (took %.1fs)\n",
+            sel_mcv$t,
+            as.numeric(difftime(Sys.time(), t_start, units = "secs"))))
+
+# cv_per_module: per-module adaptive t.
+t_step <- Sys.time()
+out_modules <- magic_modules(X, n_modules = 8L, t_values = 1:10,
+                             npca = NPCA, k = K, seed = 1L)
+imp_cv_per_module <- out_modules$imputed
+cat(sprintf("cv_per_module  t = %s  (took %.1fs)\n",
+            paste(out_modules$t_per_module, collapse = ","),
+            as.numeric(difftime(Sys.time(), t_step, units = "secs"))))
+
+# rmagic_auto: upstream Python MAGIC with t = "auto".
+t_step <- Sys.time()
+X_named <- X
+colnames(X_named) <- rownames(cnts)
+rownames(X_named) <- colnames(cnts)
+out_rmagic <- Rmagic::magic(X_named, t = "auto", knn = K, npca = NPCA,
+                            verbose = 0)
+imp_rmagic_auto <- as.matrix(out_rmagic$result)
+cat(sprintf("rmagic_auto    t = auto  (took %.1fs)\n",
+            as.numeric(difftime(Sys.time(), t_step, units = "secs"))))
+
+# Sanity: imputed matrices should have the same dims as X.
+stopifnot(all(dim(imp_cv_mcv)        == dim(X)))
+stopifnot(all(dim(imp_cv_per_module) == dim(X)))
+stopifnot(all(dim(imp_rmagic_auto)   == dim(X)))
+```
+
+## Cluster preservation
+
+We cluster each matrix (raw and three imputed) with Seurat's
+graph-based Louvain at a common resolution, then measure ARI of the
+imputed clusterings against the raw clustering. "Preservation" here
+means: does imputation keep the cluster structure visible in the raw
+data, or distort it?
+
+```{r cluster}
+cluster_louvain <- function(mat, npca = 20L, k_param = 20L, res = 0.6) {
+  rownames(mat) <- paste0("cell", seq_len(nrow(mat)))
+  colnames(mat) <- paste0("g",   seq_len(ncol(mat)))
+  obj <- CreateSeuratObject(counts = t(mat), assay = "RNA")
+  obj <- SetAssayData(obj, assay = "RNA", layer = "data",
+                      new.data = log1p(t(mat)))
+  VariableFeatures(obj) <- colnames(mat)
+  obj <- ScaleData(obj, verbose = FALSE)
+  obj <- RunPCA(obj, npcs = npca, verbose = FALSE,
+                features = VariableFeatures(obj))
+  obj <- FindNeighbors(obj, dims = seq_len(npca), k.param = k_param,
+                       verbose = FALSE)
+  obj <- FindClusters(obj, resolution = res, verbose = FALSE,
+                      random.seed = 1L)
+  as.integer(as.character(Idents(obj)))
+}
+
+cl_raw <- cluster_louvain(X)
+cl_mcv <- cluster_louvain(imp_cv_mcv)
+cl_per <- cluster_louvain(imp_cv_per_module)
+cl_rma <- cluster_louvain(imp_rmagic_auto)
+
+cluster_tbl <- data.frame(
+  method   = c("cv_mcv", "cv_per_module", "rmagic_auto"),
+  n_clust  = c(length(unique(cl_mcv)),
+               length(unique(cl_per)),
+               length(unique(cl_rma))),
+  ari_raw  = c(adjustedRandIndex(cl_mcv, cl_raw),
+               adjustedRandIndex(cl_per, cl_raw),
+               adjustedRandIndex(cl_rma, cl_raw))
+)
+cat(sprintf("Raw clustering: %d clusters\n", length(unique(cl_raw))))
+print(cluster_tbl, row.names = FALSE)
+```
+
+## TF-target prediction AUC
+
+Curated hematopoietic TF-target relationships (from the lineage-marker
+literature: Tusi et al. 2018, Olsson et al. 2016, Paul et al. 2015).
+The list is intentionally small (high-confidence) so the comparison is
+between methods, not between databases.
+
+```{r tf-targets}
+tf_targets <- list(
+  Gata1 = c("Klf1", "Hba-a1", "Hba-a2", "Hbb-b1", "Hbb-b2",
+            "Aqp1", "Slc4a1", "Gypa", "Epor"),
+  Gata2 = c("Gata1", "Klf1", "Itga2b"),
+  Klf1  = c("Hba-a1", "Hba-a2", "Hbb-b1", "Hbb-b2", "Aqp1", "Slc4a1"),
+  Sfpi1 = c("Cebpa", "Mpo", "Csf1r", "Csf2ra", "Csf2rb"),
+  Cebpa = c("Mpo", "Elane", "Prtn3", "Ctsg", "Csf3r"),
+  Cebpe = c("Mpo", "Elane", "Prtn3", "Ctsg"),
+  Gfi1  = c("Csf1r", "Elane"),
+  Irf8  = c("Cxcr4"),
+  Tal1  = c("Gata1", "Klf1", "Gata2")
+)
+
+gene_set <- colnames(X_named)
+score_method <- function(imp_mat) {
+  pos <- data.frame(tf = character(), target = character(),
+                    score = numeric(), label = integer())
+  neg <- data.frame(tf = character(), target = character(),
+                    score = numeric(), label = integer())
+  set.seed(7L)
+  for (tf in names(tf_targets)) {
+    if (!(tf %in% gene_set)) next
+    targets <- intersect(tf_targets[[tf]], gene_set)
+    if (length(targets) == 0L) next
+    # Skip the TF itself from the non-target pool.
+    non_target_pool <- setdiff(gene_set, c(tf, targets))
+    n_neg <- min(length(non_target_pool), 5L * length(targets))
+    non_targets <- sample(non_target_pool, n_neg)
+
+    tf_vec <- imp_mat[, tf]
+    # |Spearman| (rank correlation, robust to MAGIC's smoothing).
+    cor_pos <- abs(suppressWarnings(
+      apply(imp_mat[, targets, drop = FALSE], 2, function(g)
+        cor(tf_vec, g, method = "spearman"))))
+    cor_neg <- abs(suppressWarnings(
+      apply(imp_mat[, non_targets, drop = FALSE], 2, function(g)
+        cor(tf_vec, g, method = "spearman"))))
+    cor_pos[is.na(cor_pos)] <- 0
+    cor_neg[is.na(cor_neg)] <- 0
+
+    pos <- rbind(pos, data.frame(tf = tf, target = targets,
+                                 score = cor_pos, label = 1L))
+    neg <- rbind(neg, data.frame(tf = tf, target = non_targets,
+                                 score = cor_neg, label = 0L))
+  }
+  all_pairs <- rbind(pos, neg)
+  auc <- as.numeric(pROC::roc(all_pairs$label, all_pairs$score,
+                              levels = c(0L, 1L), direction = "<",
+                              quiet = TRUE)$auc)
+  list(auc = auc, pairs = all_pairs)
+}
+
+# Add column names back to imputed matrices.
+colnames(imp_cv_mcv)        <- colnames(X_named)
+colnames(imp_cv_per_module) <- colnames(X_named)
+colnames(imp_rmagic_auto)   <- colnames(X_named)
+
+raw_named <- X_named
+auc_raw <- score_method(raw_named)
+auc_mcv <- score_method(imp_cv_mcv)
+auc_per <- score_method(imp_cv_per_module)
+auc_rma <- score_method(imp_rmagic_auto)
+
+cat(sprintf("\nTF-target AUC\n"))
+cat(sprintf("  raw            %.3f  (%d pos pairs scored)\n",
+            auc_raw$auc, sum(auc_raw$pairs$label == 1)))
+cat(sprintf("  cv_mcv         %.3f\n", auc_mcv$auc))
+cat(sprintf("  cv_per_module  %.3f\n", auc_per$auc))
+cat(sprintf("  rmagic_auto    %.3f\n", auc_rma$auc))
+```
+
+## Summary table
+
+```{r summary}
+summary_tbl <- data.frame(
+  method       = c("raw",   "cv_mcv",        "cv_per_module", "rmagic_auto"),
+  n_clusters   = c(length(unique(cl_raw)), length(unique(cl_mcv)),
+                   length(unique(cl_per)), length(unique(cl_rma))),
+  ARI_vs_raw   = c(1.0, cluster_tbl$ari_raw),
+  TF_target_AUC = c(auc_raw$auc, auc_mcv$auc, auc_per$auc, auc_rma$auc)
+)
+print(summary_tbl, row.names = FALSE)
+```
+
+## Figure
+
+```{r plot, fig.width = 8.5, fig.height = 3.4}
+plot_df <- summary_tbl[summary_tbl$method != "raw", ]
+plot_df$method <- factor(plot_df$method,
+                         levels = c("cv_mcv", "cv_per_module", "rmagic_auto"))
+
+palette <- c("cv_mcv" = "#1f77b4",
+             "cv_per_module" = "#5fa8d3",
+             "rmagic_auto"   = "#ff7f0e")
+
+p_ari <- ggplot(plot_df, aes(method, ARI_vs_raw, fill = method)) +
+  geom_col(width = 0.6, colour = "black", linewidth = 0.25) +
+  geom_text(aes(label = sprintf("%.3f", ARI_vs_raw)),
+            vjust = -0.4, size = 3) +
+  scale_fill_manual(values = palette, guide = "none") +
+  scale_y_continuous(limits = c(0, max(plot_df$ARI_vs_raw) * 1.18),
+                     expand = c(0, 0)) +
+  labs(x = NULL, y = "ARI (vs. raw clustering)",
+       title = "(a) Cluster preservation") +
+  theme_classic(base_size = 10) +
+  theme(plot.title = element_text(size = 11),
+        axis.text.x = element_text(angle = 25, hjust = 1))
+
+# Include `raw` in the AUC bar to show the lift from imputation.
+auc_df <- summary_tbl
+auc_df$method <- factor(auc_df$method,
+                        levels = c("raw", "cv_mcv", "cv_per_module",
+                                   "rmagic_auto"))
+auc_palette <- c("raw" = "#bbbbbb", palette)
+
+p_auc <- ggplot(auc_df, aes(method, TF_target_AUC, fill = method)) +
+  geom_col(width = 0.6, colour = "black", linewidth = 0.25) +
+  geom_text(aes(label = sprintf("%.3f", TF_target_AUC)),
+            vjust = -0.4, size = 3) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "grey50") +
+  scale_fill_manual(values = auc_palette, guide = "none") +
+  scale_y_continuous(limits = c(0, max(auc_df$TF_target_AUC) * 1.18),
+                     expand = c(0, 0)) +
+  labs(x = NULL, y = "ROC AUC",
+       title = "(b) TF-target prediction") +
+  theme_classic(base_size = 10) +
+  theme(plot.title = element_text(size = 11),
+        axis.text.x = element_text(angle = 25, hjust = 1))
+
+fig <- p_ari + p_auc + plot_layout(widths = c(1, 1.25))
+
+ggsave(file.path(fig_dir, "fig_paul_realdata.png"), fig,
+       width = 8.5, height = 3.4, dpi = 220, bg = "white")
+
+fig
+```
+
+## Caveats
+
+* **Cluster preservation is measured against the *raw* clustering**, not
+  against published Paul 2015 cell-type annotations. The original Paul
+  annotations (MetaCell 1-19 clusters) are not in the GEO supplementary
+  files and were not retrieved here. ARI against raw measures whether
+  imputation preserves the structure visible in the data, not whether
+  it recovers ground truth.
+* The TF-target list is small (<= 9 TFs, <= ~30 known pairs after
+  intersecting with the variable-gene set) and human-curated. AUC is
+  therefore noisy; a larger curated database (e.g. TRRUST,
+  hematopoiesis-specific ChIP-seq targets) would give a tighter
+  estimate.
+* Cells were subsampled to **1 500** of the ~10 000 in the original
+  paper, and we kept the **2 000** highest-variance genes. Increase
+  `n_cells_keep` / `n_genes_keep` for the full benchmark; runtime
+  scales roughly linearly in cells and in genes.
+* **FACS-protein correlation**: the third metric named in the
+  article, does not apply: Paul 2015 has no paired protein
+  measurements per cell. The natural dataset for that comparison is
+  the original MAGIC paper's HMLE TGF-beta EMT data with CD44 FACS
+  (GSE114397).

@@ -1,0 +1,147 @@
+---
+title: "MAGIC-CLR external validation on DoRothEA (A/B) regulons"
+output: html_notebook
+---
+
+The curated TF-target benchmark used ~9 TFs and ~40 positives per
+dataset, specified only in the notebooks. To address that, this notebook
+re-runs the raw-vs-CLR comparison against a large, external, standard
+regulon database: **DoRothEA** confidence levels A and B (Garcia-Alonso
+et al. 2019; 123 mouse / 118 human TFs, thousands of interactions),
+which cannot be cherry-picked. Mouse datasets (Paul, TM, Tusi) use
+`dorothea_mm`; the human dataset (PBMC) uses `dorothea_hs`.
+
+For each TF with >=3 targets present, positives are its DoRothEA targets
+and negatives are non-target genes, evaluated under both random sampling
+and detection/expression matching. We report raw vs CLR oracle AUC and
+deployable-$t$ AUC ($t=0$ and unsupervised \texttt{cv\_mcv} $t$). Uses
+the shipped \texttt{cvMAGIC::clr\_from\_cor}.
+
+```{r setup, message=FALSE}
+suppressPackageStartupMessages({
+  library(cvMAGIC); library(Rmagic); library(Matrix); library(dorothea)
+  library(dplyr); library(tidyr); library(ggplot2)
+})
+stopifnot(Rmagic::pymagic_is_available(), "clr_from_cor" %in% getNamespaceExports("cvMAGIC"))
+data(dorothea_mm, package="dorothea"); data(dorothea_hs, package="dorothea")
+reg_mm <- subset(dorothea_mm, confidence %in% c("A","B"))[,c("tf","target")]
+reg_hs <- subset(dorothea_hs, confidence %in% c("A","B"))[,c("tf","target")]
+fig_dir<-normalizePath(file.path("..","figures"),mustWork=FALSE)
+data_dir<-normalizePath(file.path("..","data"),mustWork=FALSE)
+out_dir<-normalizePath(file.path("..","notebooks"),mustWork=FALSE)
+NPCA<-20L; K<-30L; T_GRID<-0:10; SEEDS<-101:103; N_HVG<-3000L; MIN_TARGETS<-3L
+```
+
+```{r helpers}
+fast_auc<-function(s,l){r<-rank(s);np<-sum(l==1);nn<-sum(l==0);if(np==0||nn==0)return(NA_real_);(sum(r[l==1])-np*(np+1)/2)/(np*nn)}
+# panel: 1500 cells; genes expressed >=3% cells, top N_HVG by var, unioned with regulon genes present >=1%
+build_panel<-function(M,reg,min_lib,seed,n_cells=1500L){
+  ls<-rowSums(M);keep<-which(ls>=min_lib&ls<=quantile(ls,0.99));set.seed(seed)
+  ci<-sample(keep,min(n_cells,length(keep)));cn<-M[ci,,drop=FALSE]
+  gp<-colMeans(cn>0)
+  reg_genes<-intersect(unique(c(reg$tf,reg$target)), colnames(cn)[gp>=0.01])
+  base<-colnames(cn)[gp>=0.03]
+  gv<-apply(cn[,base,drop=FALSE],2,var); hv<-base[order(gv,decreasing=TRUE)[seq_len(min(N_HVG,length(base)))]]
+  X<-cn[,union(hv,reg_genes),drop=FALSE];storage.mode(X)<-"integer";X}
+# regulon pairs with matched OR random negatives
+make_pairs<-function(reg,gs,X,seed,matched=TRUE,neg_mult=5L){
+  det<-colMeans(X>0);lm<-log1p(colMeans(X));zd<-as.numeric(scale(det));zl<-as.numeric(scale(lm));names(zd)<-names(zl)<-gs
+  set.seed(seed);tfs<-intersect(unique(reg$tf),gs);rows<-list()
+  for(f in tfs){ all_t<-intersect(reg$target[reg$tf==f],gs); all_t<-setdiff(all_t,f)
+    if(length(all_t)<MIN_TARGETS) next
+    pool<-setdiff(gs,c(f,intersect(reg$target[reg$tf==f],gs)))
+    if(matched){ negs<-character(0)
+      for(g in all_t){ cand<-setdiff(pool,negs); d<-(zd[cand]-zd[g])^2+(zl[cand]-zl[g])^2
+        near<-cand[order(d)[seq_len(min(20L,length(cand)))]]; negs<-c(negs,sample(near,min(neg_mult,length(near)))) }
+      negs<-unique(negs)
+    } else negs<-sample(pool,min(length(pool),neg_mult*length(all_t)))
+    rows[[f]]<-rbind(data.frame(tf=f,gene=all_t,label=1L),data.frame(tf=f,gene=negs,label=0L)) }
+  do.call(rbind,rows)}
+raw_sc<-function(C,pr) abs(mapply(function(a,b)C[a,b],pr$tf,pr$gene))
+clr_sc<-function(Z,pr) mapply(function(a,b)Z[a,b],pr$tf,pr$gene)
+
+eval_ds<-function(X,reg){
+  gs<-colnames(X); g<-magic_graph(X,npca=NPCA,k=K); mcv_t<-mcv_select_t(X,t_values=0:10,npca=NPCA,k=K,seed=1L)$t
+  pr_m<-make_pairs(reg,gs,X,seed=7L,matched=TRUE); pr_r<-make_pairs(reg,gs,X,seed=7L,matched=FALSE)
+  Y<-X;prev<-0L;rows<-list()
+  for(t in T_GRID){ while(prev<t){Y<-as.matrix(g$M%*%Y);prev<-prev+1L}
+    imp<-if(t==0L) as.matrix(X) else Y; colnames(imp)<-gs
+    C<-suppressWarnings(cor(imp,method="spearman"));C[is.na(C)]<-0;Z<-clr_from_cor(C)
+    rows[[as.character(t)]]<-data.frame(t=t,
+      raw_m=fast_auc(raw_sc(C,pr_m),pr_m$label), clr_m=fast_auc(clr_sc(Z,pr_m),pr_m$label),
+      raw_r=fast_auc(raw_sc(C,pr_r),pr_r$label), clr_r=fast_auc(clr_sc(Z,pr_r),pr_r$label)) }
+  cv<-do.call(rbind,rows)
+  list(curve=cv, mcv_t=mcv_t,
+       n_tf=length(unique(pr_m$tf)), n_pos=sum(pr_m$label==1), n_neg=sum(pr_m$label==0)) }
+```
+
+```{r loaders}
+load_paul<-function(){cf<-data.table::fread(file.path(data_dir,"GSE72857_umitab.txt"),sep="\t",header=TRUE,data.table=FALSE);gn<-cf[[1]];cf<-as.matrix(cf[,-1]);rownames(cf)<-gn;M<-t(cf);storage.mode(M)<-"integer";M}
+load_pbmc<-function(){d<-file.path(data_dir,"filtered_gene_bc_matrices","hg19");m<-Matrix::readMM(file.path(d,"matrix.mtx"));gt<-read.table(file.path(d,"genes.tsv"),sep="\t");rownames(m)<-make.unique(gt$V2);m<-as.matrix(t(m));storage.mode(m)<-"integer";m}
+load_tm<-function(){d<-file.path(data_dir,"droplet","Marrow-10X_P7_2");m<-Matrix::readMM(file.path(d,"matrix.mtx"));gt<-read.table(file.path(d,"genes.tsv"),sep="\t");rownames(m)<-make.unique(gt$V1);m<-as.matrix(t(m));storage.mode(m)<-"integer";m}
+load_tusi<-function(){csv<-file.path(data_dir,"GSM2388072_basal_bone_marrow.raw_umifm_counts.csv");df<-data.table::fread(csv,sep=",",header=TRUE,data.table=FALSE);meta<-c("cell_id","barcode","library_id","seq_run_id","pass_filter");M<-as.matrix(df[,setdiff(colnames(df),meta)]);rownames(M)<-df$cell_id;storage.mode(M)<-"integer";M}
+specs<-list(
+  Paul=list(load=load_paul,reg=reg_mm,min_lib=500L),
+  PBMC=list(load=load_pbmc,reg=reg_hs,min_lib=500L),
+  TM  =list(load=load_tm,  reg=reg_mm,min_lib=500L),
+  Tusi=list(load=load_tusi,reg=reg_mm,min_lib=1000L))
+```
+
+```{r run, message=FALSE}
+rows<-list()
+for(nm in names(specs)){ sp<-specs[[nm]]; M<-sp$load(); cat(sprintf("\n=== %s ===\n",nm))
+  for(s in SEEDS){ X<-build_panel(M,sp$reg,sp$min_lib,seed=s); e<-eval_ds(X,sp$reg); cv<-e$curve
+    rmg<-as.matrix(Rmagic::magic(X,t="auto",knn=K,npca=NPCA,verbose=0)$result);colnames(rmg)<-colnames(X)
+    Cr<-suppressWarnings(cor(rmg,method="spearman"));Cr[is.na(Cr)]<-0;Zr<-clr_from_cor(Cr)
+    pr_m<-make_pairs(sp$reg,colnames(X),X,seed=7L,matched=TRUE)
+    rmg_raw<-fast_auc(raw_sc(Cr,pr_m),pr_m$label); rmg_clr<-fast_auc(clr_sc(Zr,pr_m),pr_m$label)
+    rows[[paste(nm,s)]]<-data.frame(dataset=nm,seed=s,n_tf=e$n_tf,n_pos=e$n_pos,n_neg=e$n_neg,mcv_t=e$mcv_t,
+      # matched negatives
+      raw_oracle=max(cv$raw_m), clr_oracle=max(cv$clr_m),
+      raw_t0=cv$raw_m[cv$t==0], clr_t0=cv$clr_m[cv$t==0],
+      raw_mcv=cv$raw_m[cv$t==e$mcv_t], clr_mcv=cv$clr_m[cv$t==e$mcv_t],
+      rmagic_raw=rmg_raw, rmagic_clr=rmg_clr,
+      # random negatives (oracle)
+      raw_oracle_rand=max(cv$raw_r), clr_oracle_rand=max(cv$clr_r))
+    cat(sprintf("  seed %d | TFs=%d pos=%d neg=%d | matched: raw_or=%.3f clr_or=%.3f t0 raw=%.3f clr=%.3f | rand: raw=%.3f clr=%.3f\n",
+      s,e$n_tf,e$n_pos,e$n_neg,max(cv$raw_m),max(cv$clr_m),cv$raw_m[cv$t==0],cv$clr_m[cv$t==0],max(cv$raw_r),max(cv$clr_r))) }
+  rm(M); invisible(gc()) }
+res<-do.call(rbind,rows)
+write.csv(res,file.path(out_dir,"dorothea_validation_results.csv"),row.names=FALSE)
+```
+
+```{r summary}
+agg<-res|>group_by(dataset)|>summarise(
+  n_tf=round(mean(n_tf)), n_pos=round(mean(n_pos)), n_neg=round(mean(n_neg)),
+  raw_oracle=mean(raw_oracle), clr_oracle=mean(clr_oracle),
+  raw_t0=mean(raw_t0), clr_t0=mean(clr_t0),
+  raw_mcv=mean(raw_mcv), clr_mcv=mean(clr_mcv),
+  rmagic_raw=mean(rmagic_raw), rmagic_clr=mean(rmagic_clr),
+  raw_oracle_rand=mean(raw_oracle_rand), clr_oracle_rand=mean(clr_oracle_rand),
+  .groups="drop")|>arrange(match(dataset,c("Paul","PBMC","TM","Tusi")))
+cat("DoRothEA A/B validation (mean over",length(SEEDS),"seeds). MATCHED negatives:\n")
+print(as.data.frame(agg|>transmute(dataset,n_tf,n_pos,n_neg,
+  raw_oracle,clr_oracle,d_oracle=clr_oracle-raw_oracle,
+  d_t0=clr_t0-raw_t0, d_mcv=clr_mcv-raw_mcv, d_rmagic=rmagic_clr-rmagic_raw)),row.names=FALSE,digits=3)
+cat("\nRandom negatives (oracle): clr - raw\n")
+print(as.data.frame(agg|>transmute(dataset, raw=raw_oracle_rand, clr=clr_oracle_rand, d=clr_oracle_rand-raw_oracle_rand)),row.names=FALSE,digits=3)
+cat("\nPer-seed clr-raw (matched, oracle) all positive?\n")
+for(d in unique(res$dataset)){x<-res$clr_oracle[res$dataset==d]-res$raw_oracle[res$dataset==d]
+  cat(sprintf("  %-5s: %s  (>0 %d/%d)\n",d,paste(sprintf('%+.3f',x),collapse=', '),sum(x>0),length(x)))}
+```
+
+```{r fig, fig.width=9, fig.height=4}
+long<-agg|>transmute(dataset, `t=0`=clr_t0-raw_t0, `cv_mcv`=clr_mcv-raw_mcv,
+  oracle=clr_oracle-raw_oracle, rmagic=rmagic_clr-rmagic_raw)|>
+  pivot_longer(-dataset,names_to="setting",values_to="gain")|>
+  mutate(dataset=factor(dataset,levels=c("Paul","PBMC","TM","Tusi")),
+         setting=factor(setting,levels=c("t=0","cv_mcv","rmagic","oracle")))
+fig<-ggplot(long,aes(setting,gain,fill=setting))+geom_col(width=.7,colour="black",linewidth=.2)+
+  geom_hline(yintercept=0,linewidth=.3)+facet_wrap(~dataset,nrow=1)+
+  scale_fill_brewer(palette="Set2",guide="none")+
+  labs(x=NULL,y="CLR - raw AUC gain",
+       title="MAGIC-CLR on DoRothEA A/B regulons (matched negatives), by deployable t setting")+
+  theme_classic(base_size=10)+theme(axis.text.x=element_text(angle=25,hjust=1))
+ggsave(file.path(fig_dir,"fig_dorothea.png"),fig,width=9,height=4,dpi=220,bg="white")
+fig
+```

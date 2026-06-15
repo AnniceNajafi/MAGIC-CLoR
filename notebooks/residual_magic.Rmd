@@ -1,0 +1,162 @@
+---
+title: "ResidualMAGIC: null-calibrating post-diffusion correlations (CLR) for relationship recovery"
+output: html_notebook
+---
+
+Every prior attempt changed the *imputation* (t, mixtures, graph) and
+none gave a generalising win. This one leaves MAGIC's imputation
+untouched and changes the **interaction score**. MAGIC is known to
+inflate correlations manifold-wide: after diffusion, nearby cells share
+state, lineage, and library size, so many gene pairs co-vary for reasons
+unrelated to regulation. Original MAGIC ranks pairs by raw
+$|\mathrm{Spearman}|$ of the imputed columns. We instead **null-calibrate**
+each correlation against a background, asking *is this TF$\rightarrow$target
+association stronger than expected given how connected each gene is in
+general?*
+
+This is the **Context Likelihood of Relatedness** idea (Faith et al.\
+2007) applied to post-MAGIC correlations. For genes $i,j$ with imputed
+Spearman $s_{ij}$, and background means/sds $\mu_i,\sigma_i$ of gene $i$'s
+correlations:
+\[
+  z_i=\max\!\Big(0,\tfrac{s_{ij}-\mu_i}{\sigma_i}\Big),\quad
+  \mathrm{CLR}_{ij}=\sqrt{z_i^2+z_j^2}.
+\]
+We test two background definitions: **global** (all genes) and
+**matched** (genes in the same detection-rate decile as the partner,
+a detection-rate-matched null).
+
+```{r setup, message=FALSE}
+suppressPackageStartupMessages({
+  library(cvMAGIC); library(Rmagic); library(Matrix); library(dplyr); library(tidyr)
+  library(ggplot2); library(patchwork)
+})
+stopifnot(Rmagic::pymagic_is_available())
+fig_dir<-normalizePath(file.path("..","figures"),mustWork=FALSE)
+data_dir<-normalizePath(file.path("..","data"),mustWork=FALSE)
+out_dir<-normalizePath(file.path("..","notebooks"),mustWork=FALSE)
+NPCA<-20L; K<-30L; T_GRID<-0:10; SEEDS<-101:105
+```
+
+```{r tf-lists}
+tf_mouse<-list(
+  Gata1=c("Klf1","Hba-a1","Hba-a2","Hbb-b1","Hbb-b2","Aqp1","Slc4a1","Gypa","Epor"),
+  Gata2=c("Gata1","Klf1","Itga2b"),Klf1=c("Hba-a1","Hba-a2","Hbb-b1","Hbb-b2","Aqp1","Slc4a1"),
+  Sfpi1=c("Cebpa","Mpo","Csf1r","Csf2ra","Csf2rb"),Cebpa=c("Mpo","Elane","Prtn3","Ctsg","Csf3r"),
+  Cebpe=c("Mpo","Elane","Prtn3","Ctsg"),Gfi1=c("Csf1r","Elane"),Irf8=c("Cxcr4"),Tal1=c("Gata1","Klf1","Gata2"))
+tf_tusi<-tf_mouse; names(tf_tusi)[names(tf_tusi)=="Sfpi1"]<-"Spi1"
+tf_tusi<-lapply(tf_tusi,function(v){v[v=="Hbb-b1"]<-"Hbb-bs";v[v=="Hbb-b2"]<-"Hbb-bt";v})
+tf_human<-list(
+  PAX5=c("CD19","MS4A1","CD79A","CD79B","BLNK","BANK1","BCL11A"),TBX21=c("IFNG","GZMB","CXCR3","GNLY","PRF1","NKG7"),
+  EOMES=c("IFNG","GZMA","PRF1","GNLY","NKG7","KLRD1"),FOXP3=c("IL2RA","CTLA4","TNFRSF18"),
+  SPI1=c("CD14","LYZ","CSF1R","FCGR3A","CST3","S100A8","S100A9"),IRF8=c("CCR7","FLT3","CST3","HLA-DRA"),
+  CEBPB=c("CD14","LYZ","S100A8","S100A9"),LEF1=c("SELL","CCR7","TCF7"),KLF2=c("SELL","S1PR1","CCR7"),ID3=c("SELL","CCR7"))
+```
+
+```{r helpers}
+build_panel<-function(M,tf,min_lib,gene_pos,seed,n_cells=1500L,n_genes=2000L){
+  ls<-rowSums(M);keep<-which(ls>=min_lib&ls<=quantile(ls,0.99));set.seed(seed)
+  ci<-sample(keep,min(n_cells,length(keep)));cn<-M[ci,,drop=FALSE]
+  mk<-intersect(unique(c(names(tf),unlist(tf))),colnames(cn))
+  gp<-colMeans(cn>0);cn<-cn[,gp>=gene_pos|colnames(cn)%in%mk,drop=FALSE]
+  gv<-apply(cn,2,var);hv<-order(gv,decreasing=TRUE)[seq_len(min(n_genes,length(gv)))]
+  X<-cn[,union(colnames(cn)[hv],mk),drop=FALSE];storage.mode(X)<-"integer";X}
+fast_auc<-function(scores,labels){r<-rank(scores);np<-sum(labels==1);nn<-sum(labels==0)
+  if(np==0||nn==0)return(NA_real_);(sum(r[labels==1])-np*(np+1)/2)/(np*nn)}
+make_pairs<-function(tf,gs,seed=7L){set.seed(seed);rows<-list()
+  for(f in names(tf)){if(!(f%in%gs))next;tg<-intersect(tf[[f]],gs);if(!length(tg))next
+    pool<-setdiff(gs,c(f,tg));ng<-sample(pool,min(length(pool),5L*length(tg)))
+    rows[[f]]<-rbind(data.frame(tf=f,gene=tg,label=1L),data.frame(tf=f,gene=ng,label=0L))}
+  do.call(rbind,rows)}
+
+# scorings given a full gene-gene corr matrix C (genes x genes), detection-decile bin vector
+score_raw <- function(C,pr) abs(mapply(function(a,b)C[a,b],pr$tf,pr$gene))
+score_clr <- function(C,pr){ mu<-rowMeans(C); sg<-apply(C,1,sd); sg[sg==0]<-1
+  zi<-pmax(0,(mapply(function(a,b)C[a,b],pr$tf,pr$gene)-mu[pr$tf])/sg[pr$tf])
+  zj<-pmax(0,(mapply(function(a,b)C[a,b],pr$tf,pr$gene)-mu[pr$gene])/sg[pr$gene])
+  sqrt(zi^2+zj^2) }
+score_clr_matched <- function(C,pr,bin){            # null = partner's detection-decile peers
+  genes<-rownames(C); by_bin<-split(genes, bin[genes])
+  z_for<-function(anchor,partner){                  # is corr(anchor,partner) high vs corr(anchor, peers-of-partner)?
+    peers<-setdiff(by_bin[[bin[partner]]],c(anchor,partner)); if(length(peers)<5) return(0)
+    v<-C[anchor,peers]; m<-mean(v); s<-sd(v); if(is.na(s)||s==0) return(0)
+    max(0,(C[anchor,partner]-m)/s) }
+  vapply(seq_len(nrow(pr)),function(r){
+    a<-pr$tf[r]; b<-pr$gene[r]; sqrt(z_for(a,b)^2 + z_for(b,a)^2)}, numeric(1)) }
+
+eval_dataset <- function(X,tf){
+  gs<-colnames(X); pr<-make_pairs(tf,gs); g<-magic_graph(X,npca=NPCA,k=K)
+  det<-colMeans(X>0); bin<-setNames(as.integer(cut(rank(det,ties.method="first"),
+                       breaks=quantile(rank(det),probs=seq(0,1,.1)),include.lowest=TRUE)), gs)
+  Y<-X; prev<-0L; out<-list()
+  for(t in T_GRID){ while(prev<t){Y<-as.matrix(g$M%*%Y);prev<-prev+1L}
+    imp<-if(t==0L) as.matrix(X) else Y; colnames(imp)<-gs
+    C<-suppressWarnings(cor(imp,method="spearman")); C[is.na(C)]<-0
+    out[[as.character(t)]]<-data.frame(t=t,
+      raw=fast_auc(score_raw(C,pr),pr$label),
+      clr=fast_auc(score_clr(C,pr),pr$label),
+      clr_matched=fast_auc(score_clr_matched(C,pr,bin),pr$label)) }
+  # rmagic reference (raw scoring)
+  rmg<-as.matrix(Rmagic::magic(X,t="auto",knn=K,npca=NPCA,verbose=0)$result);colnames(rmg)<-gs
+  Cr<-suppressWarnings(cor(rmg,method="spearman"));Cr[is.na(Cr)]<-0
+  list(curve=do.call(rbind,out), rmagic_raw=fast_auc(score_raw(Cr,pr),pr$label)) }
+```
+
+```{r loaders}
+load_paul<-function(){cf<-data.table::fread(file.path(data_dir,"GSE72857_umitab.txt"),sep="\t",header=TRUE,data.table=FALSE);gn<-cf[[1]];cf<-as.matrix(cf[,-1]);rownames(cf)<-gn;M<-t(cf);storage.mode(M)<-"integer";M}
+load_pbmc<-function(){d<-file.path(data_dir,"filtered_gene_bc_matrices","hg19");m<-Matrix::readMM(file.path(d,"matrix.mtx"));gt<-read.table(file.path(d,"genes.tsv"),sep="\t");rownames(m)<-make.unique(gt$V2);m<-as.matrix(t(m));storage.mode(m)<-"integer";m}
+load_tm<-function(){d<-file.path(data_dir,"droplet","Marrow-10X_P7_2");m<-Matrix::readMM(file.path(d,"matrix.mtx"));gt<-read.table(file.path(d,"genes.tsv"),sep="\t");rownames(m)<-make.unique(gt$V1);m<-as.matrix(t(m));storage.mode(m)<-"integer";m}
+load_tusi<-function(){csv<-file.path(data_dir,"GSM2388072_basal_bone_marrow.raw_umifm_counts.csv");df<-data.table::fread(csv,sep=",",header=TRUE,data.table=FALSE);meta<-c("cell_id","barcode","library_id","seq_run_id","pass_filter");M<-as.matrix(df[,setdiff(colnames(df),meta)]);rownames(M)<-df$cell_id;storage.mode(M)<-"integer";M}
+specs<-list(
+  Paul=list(load=load_paul,tf=tf_mouse,min_lib=500L,gene_pos=0.05),
+  PBMC=list(load=load_pbmc,tf=tf_human,min_lib=500L,gene_pos=0.03),
+  TM  =list(load=load_tm,  tf=tf_mouse,min_lib=500L,gene_pos=0.03),
+  Tusi=list(load=load_tusi,tf=tf_tusi, min_lib=1000L,gene_pos=0.05))
+```
+
+```{r run, message=FALSE}
+rows<-list(); curves<-list()
+for(nm in names(specs)){ sp<-specs[[nm]]; M<-sp$load(); cat(sprintf("\n=== %s ===\n",nm))
+  for(s in SEEDS){ X<-build_panel(M,sp$tf,sp$min_lib,sp$gene_pos,seed=s); e<-eval_dataset(X,sp$tf)
+    cv<-e$curve
+    rows[[paste(nm,s)]]<-data.frame(dataset=nm,seed=s,
+      raw_oracle=max(cv$raw), clr_oracle=max(cv$clr), clr_matched_oracle=max(cv$clr_matched),
+      raw_t=cv$t[which.max(cv$raw)], clr_t=cv$t[which.max(cv$clr)],
+      rmagic_raw=e$rmagic_raw)
+    if(s==SEEDS[1]) curves[[nm]]<-cbind(dataset=nm,cv)
+    cat(sprintf("  seed %d | raw_oracle=%.3f clr_oracle=%.3f clr_matched=%.3f (raw t=%d, clr t=%d) rmagic=%.3f\n",
+      s,max(cv$raw),max(cv$clr),max(cv$clr_matched),cv$t[which.max(cv$raw)],cv$t[which.max(cv$clr)],e$rmagic_raw)) }
+  rm(M); invisible(gc()) }
+res<-do.call(rbind,rows); curve_df<-do.call(rbind,curves)
+write.csv(res,file.path(out_dir,"residual_magic_results.csv"),row.names=FALSE)
+write.csv(curve_df,file.path(out_dir,"residual_magic_curves.csv"),row.names=FALSE)
+```
+
+```{r summary}
+agg<-res|>group_by(dataset)|>summarise(
+  raw_oracle=mean(raw_oracle), clr_oracle=mean(clr_oracle), clr_matched=mean(clr_matched_oracle),
+  rmagic=mean(rmagic_raw),
+  clr_vs_raw=mean(clr_oracle-raw_oracle), clrm_vs_raw=mean(clr_matched_oracle-raw_oracle),
+  .groups="drop")|>arrange(match(dataset,c("Paul","PBMC","TM","Tusi")))
+cat("Oracle TF-target AUC by scoring (mean over",length(SEEDS),"seeds):\n")
+print(as.data.frame(agg),row.names=FALSE,digits=3)
+cat("\nDoes CLR scoring beat raw scoring at the oracle t? (per dataset, per seed)\n")
+for(d in unique(res$dataset)){ x<-res$clr_oracle[res$dataset==d]-res$raw_oracle[res$dataset==d]
+  y<-res$clr_matched_oracle[res$dataset==d]-res$raw_oracle[res$dataset==d]
+  cat(sprintf("  %-5s clr %+.4f (>0 %d/%d) | matched %+.4f (>0 %d/%d)\n",
+    d,mean(x),sum(x>0),length(x),mean(y),sum(y>0),length(y))) }
+```
+
+```{r fig, fig.width=11, fig.height=4}
+long<-curve_df|>pivot_longer(c(raw,clr,clr_matched),names_to="scoring",values_to="AUC")|>
+  mutate(dataset=factor(dataset,levels=c("Paul","PBMC","TM","Tusi")))
+fig<-ggplot(long,aes(t,AUC,colour=scoring))+geom_line(linewidth=.7)+geom_point(size=1)+
+  facet_wrap(~dataset,nrow=1,scales="free_y")+
+  scale_colour_manual(values=c(raw="#1f77b4",clr="#2ca02c",clr_matched="#ff7f0e"),name="scoring")+
+  scale_x_continuous(breaks=seq(0,10,2))+
+  labs(x="diffusion time t",y="TF-target AUC",
+       title="ResidualMAGIC: raw |Spearman| vs CLR null-calibrated scoring, same imputed data (seed 101)")+
+  theme_classic(base_size=10)+theme(legend.position="bottom")
+ggsave(file.path(fig_dir,"fig_residual_magic.png"),fig,width=11,height=4,dpi=220,bg="white")
+fig
+```

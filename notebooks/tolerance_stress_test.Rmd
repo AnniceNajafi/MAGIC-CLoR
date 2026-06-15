@@ -1,0 +1,300 @@
+---
+title: "Stress-testing tolerance-regularised MCV: does it really enhance MAGIC?"
+output: html_notebook
+---
+
+The tolerance rule (`mcv_select_t_tolerant`, eps=5%) only ever beat plain
+MCV on **one** dataset (Paul 2015, +0.006); on the two dense datasets it
+was inert (picked the same t=0). Its whole reason to exist is the
+**sparse** regime. This notebook stress-tests exactly that claim two
+ways:
+
+* **Part A: controlled sparsity sweep.** Take Tabula Muris marrow
+  (same mouse hematopoietic biology as Paul, same TF-target list) and
+  binomially down-sample its UMIs across a depth ladder, holding the
+  cells, the gene panel, and the biology *fixed*. The only thing that
+  changes is sparsity. If the tolerance rule is principled, its benefit
+  over plain MCV should *emerge as the data gets sparser* and *vanish
+  when dense*. If the Paul win was a fluke, the benefit never appears.
+* **Part B: Paul multi-seed robustness.** The entire tolerance claim
+  rests on a single +0.006 from one random 1500-cell subsample. Re-run
+  across many subsample seeds and ask whether the tolerant-vanilla and
+  tolerant-rmagic gaps are reliably positive or just sampling noise.
+
+Everything is measured against the same TF-target Spearman-AUC metric
+and compared head-to-head with upstream `rmagic_auto`.
+
+```{r setup, message=FALSE}
+suppressPackageStartupMessages({
+  library(cvMAGIC); library(Rmagic); library(Matrix); library(pROC)
+  library(ggplot2); library(dplyr); library(tidyr); library(patchwork)
+})
+stopifnot(Rmagic::pymagic_is_available())
+fig_dir  <- normalizePath(file.path("..", "figures"), mustWork = FALSE)
+data_dir <- normalizePath(file.path("..", "data"),    mustWork = FALSE)
+out_dir  <- normalizePath(file.path("..", "notebooks"), mustWork = FALSE)
+
+# Mouse hematopoietic TF->target programme (identical to Paul/TM notebooks)
+tf_targets <- list(
+  Gata1 = c("Klf1","Hba-a1","Hba-a2","Hbb-b1","Hbb-b2","Aqp1",
+            "Slc4a1","Gypa","Epor"),
+  Gata2 = c("Gata1","Klf1","Itga2b"),
+  Klf1  = c("Hba-a1","Hba-a2","Hbb-b1","Hbb-b2","Aqp1","Slc4a1"),
+  Sfpi1 = c("Cebpa","Mpo","Csf1r","Csf2ra","Csf2rb"),
+  Cebpa = c("Mpo","Elane","Prtn3","Ctsg","Csf3r"),
+  Cebpe = c("Mpo","Elane","Prtn3","Ctsg"),
+  Gfi1  = c("Csf1r","Elane"),
+  Irf8  = c("Cxcr4"),
+  Tal1  = c("Gata1","Klf1","Gata2"))
+
+score_method <- function(imp_mat, tf_targets, gene_set) {
+  pos <- list(); neg <- list(); set.seed(7L)
+  for (tf in names(tf_targets)) {
+    if (!(tf %in% gene_set)) next
+    targets <- intersect(tf_targets[[tf]], gene_set)
+    if (length(targets) == 0L) next
+    pool <- setdiff(gene_set, c(tf, targets))
+    non_targets <- sample(pool, min(length(pool), 5L * length(targets)))
+    tf_vec <- imp_mat[, tf]
+    cp <- abs(apply(imp_mat[, targets, drop = FALSE], 2, function(g)
+      suppressWarnings(cor(tf_vec, g, method = "spearman"))))
+    cn <- abs(apply(imp_mat[, non_targets, drop = FALSE], 2, function(g)
+      suppressWarnings(cor(tf_vec, g, method = "spearman"))))
+    cp[is.na(cp)] <- 0; cn[is.na(cn)] <- 0
+    pos[[tf]] <- data.frame(score = cp, label = 1L)
+    neg[[tf]] <- data.frame(score = cn, label = 0L)
+  }
+  pairs <- rbind(do.call(rbind, pos), do.call(rbind, neg))
+  as.numeric(pROC::roc(pairs$label, pairs$score, levels = c(0L, 1L),
+                       direction = "<", quiet = TRUE)$auc)
+}
+
+# All three selectors + oracle for one count matrix, sharing one full graph.
+eval_all <- function(X, tf_targets, t_values = 0:10, t_oracle = 0:15,
+                     npca = 20L, k = 30L, seed = 1L) {
+  gs <- colnames(X)
+  g  <- magic_graph(X, npca = npca, k = k)
+  auc_at <- function(t) {
+    imp <- if (t == 0L) X else magic_impute(X, t = t, graph = g)
+    colnames(imp) <- gs; score_method(imp, tf_targets, gs)
+  }
+  auc_curve <- sapply(t_oracle, auc_at); names(auc_curve) <- t_oracle
+  sel <- mcv_select_t(X, t_values = t_values, npca = npca, k = k, seed = seed)
+  thr <- min(sel$loss) * 1.05
+  t_tol <- sel$t_values[max(which(sel$loss <= thr))]
+  rmg <- as.matrix(Rmagic::magic(X, t = "auto", knn = k, npca = npca,
+                                 verbose = 0)$result)
+  colnames(rmg) <- gs
+  data.frame(
+    t_vanilla = sel$t,            auc_vanilla = auc_curve[as.character(sel$t)],
+    t_tol     = t_tol,            auc_tol     = auc_curve[as.character(t_tol)],
+    t_oracle  = as.integer(names(which.max(auc_curve))),
+    auc_oracle = max(auc_curve),
+    auc_rmagic = score_method(rmg, tf_targets, gs),
+    auc_raw    = auc_curve["0"],
+    row.names = NULL)
+}
+
+downsample <- function(X, p, seed) {
+  set.seed(seed)
+  Xd <- matrix(rbinom(length(X), as.vector(X), p),
+               nrow = nrow(X), ncol = ncol(X),
+               dimnames = dimnames(X))
+  storage.mode(Xd) <- "integer"; Xd
+}
+```
+
+## Part A: controlled sparsity sweep on Tabula Muris marrow
+
+Build the fixed 1500-cell / 2000-HVG marrow panel once at full depth,
+then down-sample only the counts.
+
+```{r build-tm, message=FALSE}
+mtx_dir <- file.path(data_dir, "droplet", "Marrow-10X_P7_2")
+mat <- Matrix::readMM(file.path(mtx_dir, "matrix.mtx"))
+g_tsv <- read.table(file.path(mtx_dir, "genes.tsv"), sep = "\t",
+                    header = FALSE, stringsAsFactors = FALSE)
+rownames(mat) <- make.unique(g_tsv$V1)
+colnames(mat) <- readLines(file.path(mtx_dir, "barcodes.tsv"))
+libsize   <- Matrix::colSums(mat)
+keep_cell <- libsize >= 500 & libsize <= quantile(libsize, 0.99)
+set.seed(101L)
+cell_idx  <- sample(which(keep_cell), 1500L)
+cnts <- mat[, cell_idx, drop = FALSE]
+must_keep <- intersect(unique(c(names(tf_targets), unlist(tf_targets))),
+                       rownames(cnts))
+gene_pos  <- Matrix::rowMeans(cnts > 0)
+cnts <- cnts[gene_pos >= 0.03 | rownames(cnts) %in% must_keep, , drop = FALSE]
+gene_var  <- apply(cnts, 1, function(x) var(as.numeric(x)))
+hv <- order(gene_var, decreasing = TRUE)[seq_len(min(2000L, length(gene_var)))]
+keep_genes <- union(rownames(cnts)[hv], must_keep)
+cnts <- cnts[keep_genes, , drop = FALSE]
+X_full <- as.matrix(t(cnts)); storage.mode(X_full) <- "integer"
+colnames(X_full) <- rownames(cnts); rownames(X_full) <- colnames(cnts)
+rm(mat); invisible(gc())
+cat("Full-depth panel:", nrow(X_full), "cells x", ncol(X_full),
+    "genes; median UMI/cell =", median(rowSums(X_full)), "\n")
+```
+
+```{r sweep, message=FALSE}
+depths <- c(0.05, 0.10, 0.25, 0.50, 1.00)
+seeds  <- 1:3
+sweep <- list()
+for (p in depths) for (s in seeds) {
+  Xd <- if (p == 1.0) X_full else downsample(X_full, p, seed = s)
+  r  <- eval_all(Xd, tf_targets, seed = s)
+  r$depth <- p; r$seed <- s; r$median_umi <- median(rowSums(Xd))
+  sweep[[paste(p, s)]] <- r
+  cat(sprintf("p=%.2f seed=%d  med_umi=%.0f | vanilla t=%d(%.3f) tol t=%d(%.3f) oracle t=%d(%.3f) rmagic=%.3f\n",
+              p, s, r$median_umi, r$t_vanilla, r$auc_vanilla, r$t_tol,
+              r$auc_tol, r$t_oracle, r$auc_oracle, r$auc_rmagic))
+}
+sweep_df <- do.call(rbind, sweep)
+write.csv(sweep_df, file.path(out_dir, "tolerance_stress_sweep.csv"),
+          row.names = FALSE)
+```
+
+```{r sweep-agg}
+agg <- sweep_df |>
+  group_by(median_umi = round(median_umi)) |>
+  summarise(across(c(auc_vanilla, auc_tol, auc_oracle, auc_rmagic,
+                     t_vanilla, t_tol, t_oracle),
+                   list(m = mean, sd = sd)),
+            gap_tol_van  = mean(auc_tol - auc_vanilla),
+            gap_tol_van_sd = sd(auc_tol - auc_vanilla),
+            gap_tol_rmg  = mean(auc_tol - auc_rmagic),
+            .groups = "drop") |>
+  arrange(median_umi)
+cat("Sparsity sweep (mean over seeds), sparse -> dense:\n")
+print(as.data.frame(agg[, c("median_umi","t_vanilla_m","t_tol_m","t_oracle_m",
+                            "auc_vanilla_m","auc_tol_m","auc_oracle_m",
+                            "auc_rmagic_m","gap_tol_van","gap_tol_van_sd")]),
+      row.names = FALSE, digits = 3)
+```
+
+```{r sweep-fig, fig.width = 10, fig.height = 4}
+long <- sweep_df |>
+  pivot_longer(c(auc_vanilla, auc_tol, auc_oracle, auc_rmagic),
+               names_to = "method", values_to = "AUC") |>
+  mutate(method = recode(method,
+           auc_vanilla = "cv_mcv (vanilla)", auc_tol = "magic_tolerant",
+           auc_oracle = "oracle", auc_rmagic = "rmagic_auto"))
+sumv <- long |> group_by(median_umi = round(median_umi), method) |>
+  summarise(m = mean(AUC), sd = sd(AUC), .groups = "drop")
+
+p1 <- ggplot(sumv, aes(median_umi, m, colour = method)) +
+  geom_line(linewidth = 0.8) + geom_point(size = 2) +
+  geom_errorbar(aes(ymin = m - sd, ymax = m + sd), width = 0.03, alpha = .5) +
+  scale_x_log10() +
+  scale_colour_manual(values = c("cv_mcv (vanilla)" = "#1f77b4",
+    "magic_tolerant" = "#2ca02c", "oracle" = "#d62728",
+    "rmagic_auto" = "#ff7f0e"), name = NULL) +
+  labs(x = "median UMI/cell (log; sparse -> dense)", y = "TF-target AUC",
+       title = "(a) AUC vs sequencing depth") +
+  theme_classic(base_size = 10) + theme(legend.position = "bottom")
+
+gap <- sweep_df |> group_by(median_umi = round(median_umi)) |>
+  summarise(gap = mean(auc_tol - auc_vanilla),
+            sd = sd(auc_tol - auc_vanilla), .groups = "drop")
+p2 <- ggplot(gap, aes(median_umi, gap)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_ribbon(aes(ymin = gap - sd, ymax = gap + sd), alpha = .2,
+              fill = "#2ca02c") +
+  geom_line(linewidth = 0.8, colour = "#2ca02c") +
+  geom_point(size = 2, colour = "#2ca02c") +
+  scale_x_log10() +
+  labs(x = "median UMI/cell (log; sparse -> dense)",
+       y = "AUC(tolerant) - AUC(vanilla)",
+       title = "(b) Does tolerance help as data gets sparser?") +
+  theme_classic(base_size = 10)
+
+fig <- p1 + p2 + plot_layout(widths = c(1.1, 1))
+ggsave(file.path(fig_dir, "fig_tolerance_stress_sparsity.png"), fig,
+       width = 10, height = 4.2, dpi = 220, bg = "white")
+fig
+```
+
+## Part B: Paul 2015 multi-seed robustness
+
+Re-run the original sparse win across many cell-subsample seeds.
+
+```{r paul, message=FALSE}
+txt_path <- file.path(data_dir, "GSE72857_umitab.txt")
+cf <- data.table::fread(txt_path, sep = "\t", header = TRUE, data.table = FALSE)
+gn <- cf[[1]]; cf <- as.matrix(cf[, -1, drop = FALSE]); rownames(cf) <- gn
+libsize <- colSums(cf)
+keep_cell_paul <- which(libsize >= 500 & libsize <= quantile(libsize, 0.99))
+
+paul_seeds <- 101:108
+paul <- list()
+for (s in paul_seeds) {
+  set.seed(s)
+  ci <- sample(keep_cell_paul, 1500L)
+  cn <- cf[, ci]
+  gp <- rowMeans(cn > 0); cn <- cn[gp >= 0.05, ]
+  gv <- apply(cn, 1, var)
+  gi <- order(gv, decreasing = TRUE)[seq_len(2000L)]
+  cn <- cn[gi, ]
+  Xp <- t(cn); storage.mode(Xp) <- "integer"
+  colnames(Xp) <- rownames(cn); rownames(Xp) <- colnames(cn)
+  r <- eval_all(Xp, tf_targets, seed = 1L)
+  r$seed <- s; paul[[as.character(s)]] <- r
+  cat(sprintf("Paul seed=%d | vanilla t=%d(%.3f) tol t=%d(%.3f) oracle t=%d(%.3f) rmagic=%.3f\n",
+              s, r$t_vanilla, r$auc_vanilla, r$t_tol, r$auc_tol,
+              r$t_oracle, r$auc_oracle, r$auc_rmagic))
+}
+paul_df <- do.call(rbind, paul)
+write.csv(paul_df, file.path(out_dir, "tolerance_stress_paul.csv"),
+          row.names = FALSE)
+rm(cf); invisible(gc())
+```
+
+```{r paul-stats}
+g_tv <- paul_df$auc_tol - paul_df$auc_vanilla   # tolerant vs vanilla MCV
+g_tr <- paul_df$auc_tol - paul_df$auc_rmagic    # tolerant vs upstream MAGIC
+report <- function(x, lbl) {
+  tt <- tryCatch(t.test(x), error = function(e) NULL)
+  cat(sprintf("%-28s mean=%+.4f sd=%.4f  >0 in %d/%d seeds%s\n",
+      lbl, mean(x), sd(x), sum(x > 0), length(x),
+      if (!is.null(tt)) sprintf("  (paired t p=%.3f, 95%% CI [%+.4f, %+.4f])",
+        tt$p.value, tt$conf.int[1], tt$conf.int[2]) else ""))
+}
+cat("Paul 2015 robustness across", length(paul_seeds), "subsample seeds:\n")
+report(g_tv, "tolerant - vanilla MCV")
+report(g_tr, "tolerant - rmagic_auto")
+cat(sprintf("\nMedian chosen t: vanilla=%g, tolerant=%g, oracle=%g\n",
+            median(paul_df$t_vanilla), median(paul_df$t_tol),
+            median(paul_df$t_oracle)))
+```
+
+```{r paul-fig, fig.width = 7, fig.height = 4}
+pl <- paul_df |>
+  select(seed, auc_rmagic, auc_vanilla, auc_tol, auc_oracle) |>
+  pivot_longer(-seed, names_to = "method", values_to = "AUC") |>
+  mutate(method = recode(method, auc_rmagic = "rmagic_auto",
+           auc_vanilla = "cv_mcv (vanilla)", auc_tol = "magic_tolerant",
+           auc_oracle = "oracle"),
+         method = factor(method, levels = c("rmagic_auto",
+           "cv_mcv (vanilla)", "magic_tolerant", "oracle")))
+fig2 <- ggplot(pl, aes(method, AUC, fill = method)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA, alpha = .5) +
+  geom_jitter(width = 0.12, size = 1.6, alpha = .8) +
+  scale_fill_manual(values = c("rmagic_auto" = "#ff7f0e",
+    "cv_mcv (vanilla)" = "#1f77b4", "magic_tolerant" = "#2ca02c",
+    "oracle" = "#d62728"), guide = "none") +
+  labs(x = NULL, y = "TF-target AUC",
+       title = sprintf("Paul 2015: %d-seed robustness", length(paul_seeds))) +
+  theme_classic(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+ggsave(file.path(fig_dir, "fig_tolerance_stress_paul.png"), fig2,
+       width = 7, height = 4, dpi = 220, bg = "white")
+fig2
+```
+
+## Read-out
+
+* **Part A** confirms (or refutes) the *mechanism*: the tolerant-vanilla
+  gap in panel (b) should be ~0 at high depth and grow positive as
+  median UMI/cell falls, with the chosen t tracking the oracle upward.
+* **Part B** confirms (or refutes) the *headline*: whether the Paul win
+  is reproducible across subsamples (CI excludes 0) or sampling noise.

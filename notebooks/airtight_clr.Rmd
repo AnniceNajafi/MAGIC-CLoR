@@ -1,0 +1,180 @@
+---
+title: "MAGIC-CLR airtightness: deployable t, negative-resampling stability, detection-stratified AUC"
+output: html_notebook
+---
+
+The matched-negatives control confirmed CLR beats raw scoring for genuine
+specificity. Three further checks before the result anchors the paper
+(uses the shipped `cvMAGIC::clr_from_cor`):
+
+1. **Deployable comparison.** Don't rely on oracle $t$. Report raw vs CLR
+   at $t=0$, at the unsupervised `cv_mcv` $t$, at `rmagic_auto`, and at
+   the oracle $t$. CLR should help at *deployable* settings, not just the
+   oracle.
+2. **Negative-resampling stability.** Redraw the matched negatives 5x;
+   the CLR gain should survive every draw.
+3. **Detection-stratified AUC.** Score within detection-decile strata and
+   average, so any residual pos/neg detection imbalance cannot drive the
+   gain.
+
+```{r setup, message=FALSE}
+suppressPackageStartupMessages({
+  library(cvMAGIC); library(Rmagic); library(Matrix); library(dplyr); library(tidyr)
+  library(ggplot2); library(patchwork)
+})
+stopifnot(Rmagic::pymagic_is_available(), "magic_clr" %in% getNamespaceExports("cvMAGIC"))
+fig_dir<-normalizePath(file.path("..","figures"),mustWork=FALSE)
+data_dir<-normalizePath(file.path("..","data"),mustWork=FALSE)
+out_dir<-normalizePath(file.path("..","notebooks"),mustWork=FALSE)
+NPCA<-20L; K<-30L; T_GRID<-0:10; CELL_SEEDS<-101:105; NEG_SEEDS<-c(7,17,27,37,47)
+```
+
+```{r tf-lists}
+tf_mouse<-list(
+  Gata1=c("Klf1","Hba-a1","Hba-a2","Hbb-b1","Hbb-b2","Aqp1","Slc4a1","Gypa","Epor"),
+  Gata2=c("Gata1","Klf1","Itga2b"),Klf1=c("Hba-a1","Hba-a2","Hbb-b1","Hbb-b2","Aqp1","Slc4a1"),
+  Sfpi1=c("Cebpa","Mpo","Csf1r","Csf2ra","Csf2rb"),Cebpa=c("Mpo","Elane","Prtn3","Ctsg","Csf3r"),
+  Cebpe=c("Mpo","Elane","Prtn3","Ctsg"),Gfi1=c("Csf1r","Elane"),Irf8=c("Cxcr4"),Tal1=c("Gata1","Klf1","Gata2"))
+tf_tusi<-tf_mouse; names(tf_tusi)[names(tf_tusi)=="Sfpi1"]<-"Spi1"
+tf_tusi<-lapply(tf_tusi,function(v){v[v=="Hbb-b1"]<-"Hbb-bs";v[v=="Hbb-b2"]<-"Hbb-bt";v})
+tf_human<-list(
+  PAX5=c("CD19","MS4A1","CD79A","CD79B","BLNK","BANK1","BCL11A"),TBX21=c("IFNG","GZMB","CXCR3","GNLY","PRF1","NKG7"),
+  EOMES=c("IFNG","GZMA","PRF1","GNLY","NKG7","KLRD1"),FOXP3=c("IL2RA","CTLA4","TNFRSF18"),
+  SPI1=c("CD14","LYZ","CSF1R","FCGR3A","CST3","S100A8","S100A9"),IRF8=c("CCR7","FLT3","CST3","HLA-DRA"),
+  CEBPB=c("CD14","LYZ","S100A8","S100A9"),LEF1=c("SELL","CCR7","TCF7"),KLF2=c("SELL","S1PR1","CCR7"),ID3=c("SELL","CCR7"))
+```
+
+```{r helpers}
+build_panel<-function(M,tf,min_lib,gene_pos,seed,n_cells=1500L,n_genes=2000L){
+  ls<-rowSums(M);keep<-which(ls>=min_lib&ls<=quantile(ls,0.99));set.seed(seed)
+  ci<-sample(keep,min(n_cells,length(keep)));cn<-M[ci,,drop=FALSE]
+  mk<-intersect(unique(c(names(tf),unlist(tf))),colnames(cn))
+  gp<-colMeans(cn>0);cn<-cn[,gp>=gene_pos|colnames(cn)%in%mk,drop=FALSE]
+  gv<-apply(cn,2,var);hv<-order(gv,decreasing=TRUE)[seq_len(min(n_genes,length(gv)))]
+  X<-cn[,union(colnames(cn)[hv],mk),drop=FALSE];storage.mode(X)<-"integer";X}
+fast_auc<-function(scores,labels){r<-rank(scores);np<-sum(labels==1);nn<-sum(labels==0)
+  if(np==0||nn==0)return(NA_real_);(sum(r[labels==1])-np*(np+1)/2)/(np*nn)}
+auc_strat<-function(scores,labels,strat){       # AUC within strata, count-weighted mean
+  a<-c();w<-c()
+  for(s in unique(strat[!is.na(strat)])){ i<-which(!is.na(strat) & strat==s)
+    if(sum(labels[i]==1)>0 && sum(labels[i]==0)>0){a<-c(a,fast_auc(scores[i],labels[i]));w<-c(w,length(i))}}
+  if(!length(a))return(NA_real_); sum(a*w)/sum(w)}
+make_pairs_matched<-function(tf,gs,X,seed){
+  det<-colMeans(X>0); lm<-log1p(colMeans(X))
+  zd<-as.numeric(scale(det)); zl<-as.numeric(scale(lm)); names(zd)<-names(zl)<-gs
+  set.seed(seed); rows<-list()
+  for(f in names(tf)){ if(!(f%in%gs))next; tg<-intersect(tf[[f]],gs); if(!length(tg))next
+    pool<-setdiff(gs,c(f,tg)); negs<-character(0)
+    for(g in tg){ cand<-setdiff(pool,negs); d<-(zd[cand]-zd[g])^2+(zl[cand]-zl[g])^2
+      near<-cand[order(d)[seq_len(min(20L,length(cand)))]]; negs<-c(negs,sample(near,min(5L,length(near)))) }
+    rows[[f]]<-rbind(data.frame(tf=f,gene=tg,label=1L),data.frame(tf=f,gene=unique(negs),label=0L)) }
+  do.call(rbind,rows)}
+raw_sc<-function(C,pr) abs(mapply(function(a,b)C[a,b],pr$tf,pr$gene))
+clr_sc<-function(Z,pr) mapply(function(a,b)Z[a,b],pr$tf,pr$gene)
+```
+
+```{r loaders}
+load_paul<-function(){cf<-data.table::fread(file.path(data_dir,"GSE72857_umitab.txt"),sep="\t",header=TRUE,data.table=FALSE);gn<-cf[[1]];cf<-as.matrix(cf[,-1]);rownames(cf)<-gn;M<-t(cf);storage.mode(M)<-"integer";M}
+load_pbmc<-function(){d<-file.path(data_dir,"filtered_gene_bc_matrices","hg19");m<-Matrix::readMM(file.path(d,"matrix.mtx"));gt<-read.table(file.path(d,"genes.tsv"),sep="\t");rownames(m)<-make.unique(gt$V2);m<-as.matrix(t(m));storage.mode(m)<-"integer";m}
+load_tm<-function(){d<-file.path(data_dir,"droplet","Marrow-10X_P7_2");m<-Matrix::readMM(file.path(d,"matrix.mtx"));gt<-read.table(file.path(d,"genes.tsv"),sep="\t");rownames(m)<-make.unique(gt$V1);m<-as.matrix(t(m));storage.mode(m)<-"integer";m}
+load_tusi<-function(){csv<-file.path(data_dir,"GSM2388072_basal_bone_marrow.raw_umifm_counts.csv");df<-data.table::fread(csv,sep=",",header=TRUE,data.table=FALSE);meta<-c("cell_id","barcode","library_id","seq_run_id","pass_filter");M<-as.matrix(df[,setdiff(colnames(df),meta)]);rownames(M)<-df$cell_id;storage.mode(M)<-"integer";M}
+specs<-list(
+  Paul=list(load=load_paul,tf=tf_mouse,min_lib=500L,gene_pos=0.05),
+  PBMC=list(load=load_pbmc,tf=tf_human,min_lib=500L,gene_pos=0.03),
+  TM  =list(load=load_tm,  tf=tf_mouse,min_lib=500L,gene_pos=0.03),
+  Tusi=list(load=load_tusi,tf=tf_tusi, min_lib=1000L,gene_pos=0.05))
+```
+
+```{r run, message=FALSE}
+curve<-list(); strat_rows<-list(); rmg_rows<-list()
+for(nm in names(specs)){ sp<-specs[[nm]]; M<-sp$load(); cat(sprintf("\n=== %s ===\n",nm))
+  for(cs in CELL_SEEDS){
+    X<-build_panel(M,sp$tf,sp$min_lib,sp$gene_pos,seed=cs); gs<-colnames(X)
+    det<-colMeans(X>0); strat<-as.integer(cut(rank(det,ties.method="first"),
+      breaks=10,labels=FALSE)); names(strat)<-gs
+    prs<-lapply(NEG_SEEDS,function(ns) make_pairs_matched(sp$tf,gs,X,seed=ns))
+    g<-magic_graph(X,npca=NPCA,k=K); mcv_t<-mcv_select_t(X,t_values=0:10,npca=NPCA,k=K,seed=1L)$t
+    Y<-X; prev<-0L; Ccache<-list()
+    for(t in T_GRID){ while(prev<t){Y<-as.matrix(g$M%*%Y);prev<-prev+1L}
+      imp<-if(t==0L) as.matrix(X) else Y; colnames(imp)<-gs
+      C<-suppressWarnings(cor(imp,method="spearman")); C[is.na(C)]<-0; Z<-clr_from_cor(C)
+      Ccache[[as.character(t)]]<-list(C=C,Z=Z)
+      for(ni in seq_along(NEG_SEEDS)){ pr<-prs[[ni]]
+        curve[[paste(nm,cs,t,ni)]]<-data.frame(dataset=nm,cell_seed=cs,t=t,neg_seed=NEG_SEEDS[ni],
+          raw=fast_auc(raw_sc(C,pr),pr$label), clr=fast_auc(clr_sc(Z,pr),pr$label), mcv_t=mcv_t) } }
+    # rmagic readout
+    rmg<-as.matrix(Rmagic::magic(X,t="auto",knn=K,npca=NPCA,verbose=0)$result);colnames(rmg)<-gs
+    Cr<-suppressWarnings(cor(rmg,method="spearman"));Cr[is.na(Cr)]<-0; Zr<-clr_from_cor(Cr)
+    for(ni in seq_along(NEG_SEEDS)){ pr<-prs[[ni]]
+      rmg_rows[[paste(nm,cs,ni)]]<-data.frame(dataset=nm,cell_seed=cs,neg_seed=NEG_SEEDS[ni],
+        raw=fast_auc(raw_sc(Cr,pr),pr$label), clr=fast_auc(clr_sc(Zr,pr),pr$label)) }
+    # detection-stratified AUC at oracle-clr t (neg seed 1), check (3)
+    cc<-do.call(rbind,curve[grepl(paste0("^",nm," ",cs," "),names(curve))])
+    ot<-cc|>group_by(t)|>summarise(m=mean(clr),.groups="drop"); oct<-ot$t[which.max(ot$m)]
+    C<-Ccache[[as.character(oct)]]$C; Z<-Ccache[[as.character(oct)]]$Z; pr<-prs[[1]]
+    st<-strat[pr$gene]
+    strat_rows[[paste(nm,cs)]]<-tryCatch(data.frame(dataset=nm,cell_seed=cs,oracle_clr_t=oct,
+      raw_strat=auc_strat(raw_sc(C,pr),pr$label,st), clr_strat=auc_strat(clr_sc(Z,pr),pr$label,st)),
+      error=function(e) data.frame(dataset=nm,cell_seed=cs,oracle_clr_t=oct,
+        raw_strat=NA_real_, clr_strat=NA_real_))
+    cat(sprintf("  cell_seed %d done (mcv_t=%d, oracle_clr_t=%d)\n",cs,mcv_t,oct))
+  }
+  rm(M); invisible(gc()) }
+cur<-do.call(rbind,curve); rmgdf<-do.call(rbind,rmg_rows); stratdf<-do.call(rbind,strat_rows)
+write.csv(cur,file.path(out_dir,"airtight_curve.csv"),row.names=FALSE)
+write.csv(rmgdf,file.path(out_dir,"airtight_rmagic.csv"),row.names=FALSE)
+write.csv(stratdf,file.path(out_dir,"airtight_strat.csv"),row.names=FALSE)
+```
+
+```{r check1-deployable}
+# mean over neg seeds within (dataset, cell_seed); then settings
+per<-cur|>group_by(dataset,cell_seed,t)|>summarise(raw=mean(raw),clr=mean(clr),mcv_t=first(mcv_t),.groups="drop")
+oracle<-per|>group_by(dataset,cell_seed)|>summarise(raw_oracle=max(raw),clr_oracle=max(clr),.groups="drop")
+t0<-per|>filter(t==0)|>transmute(dataset,cell_seed,raw_t0=raw,clr_t0=clr)
+mcvr<-per|>filter(t==mcv_t)|>transmute(dataset,cell_seed,raw_mcv=raw,clr_mcv=clr)
+rm_s<-rmgdf|>group_by(dataset,cell_seed)|>summarise(raw_rmagic=mean(raw),clr_rmagic=mean(clr),.groups="drop")
+dep<-oracle|>left_join(t0,by=c("dataset","cell_seed"))|>left_join(mcvr,by=c("dataset","cell_seed"))|>
+  left_join(rm_s,by=c("dataset","cell_seed"))|>
+  group_by(dataset)|>summarise(across(-cell_seed,mean),.groups="drop")|>
+  arrange(match(dataset,c("Paul","PBMC","TM","Tusi")))
+cat("CHECK 1 - Deployable comparison (mean over cell seeds): raw vs CLR at each setting\n")
+print(as.data.frame(dep|>transmute(dataset,
+  t0_raw=raw_t0,t0_clr=clr_t0, mcv_raw=raw_mcv,mcv_clr=clr_mcv,
+  rmagic_raw=raw_rmagic,rmagic_clr=clr_rmagic, oracle_raw=raw_oracle,oracle_clr=clr_oracle)),
+  row.names=FALSE,digits=3)
+cat("\n  CLR-raw at each deployable setting:\n")
+print(as.data.frame(dep|>transmute(dataset, d_t0=clr_t0-raw_t0, d_mcv=clr_mcv-raw_mcv,
+  d_rmagic=clr_rmagic-raw_rmagic, d_oracle=clr_oracle-raw_oracle)),row.names=FALSE,digits=3)
+```
+
+```{r check2-stability}
+# CLR-raw across the 5 negative draws, at the cv_mcv (deployable) t
+dep_t<-cur|>group_by(dataset,cell_seed)|>filter(t==first(mcv_t))|>ungroup()|>
+  mutate(d=clr-raw)
+cat("CHECK 2 - Negative-resampling stability (CLR-raw at deployable cv_mcv t, across 5 neg draws x 3 cell seeds):\n")
+st2<-dep_t|>group_by(dataset)|>summarise(mean_gain=mean(d),sd=sd(d),min=min(d),
+  pos=sum(d>0),n=n(),.groups="drop")|>arrange(match(dataset,c("Paul","PBMC","TM","Tusi")))
+print(as.data.frame(st2),row.names=FALSE,digits=3)
+```
+
+```{r check3-stratified}
+cat("CHECK 3 - Detection-stratified AUC (within detection-decile strata, at oracle-clr t):\n")
+st3<-stratdf|>group_by(dataset)|>summarise(raw_strat=mean(raw_strat),clr_strat=mean(clr_strat),
+  clr_minus_raw=mean(clr_strat-raw_strat),.groups="drop")|>arrange(match(dataset,c("Paul","PBMC","TM","Tusi")))
+print(as.data.frame(st3),row.names=FALSE,digits=3)
+```
+
+```{r fig, fig.width=10, fig.height=4}
+plotdf<-dep|>transmute(dataset, `t=0`=clr_t0-raw_t0, `cv_mcv`=clr_mcv-raw_mcv,
+  `rmagic`=clr_rmagic-raw_rmagic, `oracle`=clr_oracle-raw_oracle)|>
+  pivot_longer(-dataset,names_to="setting",values_to="gain")|>
+  mutate(dataset=factor(dataset,levels=c("Paul","PBMC","TM","Tusi")),
+         setting=factor(setting,levels=c("t=0","cv_mcv","rmagic","oracle")))
+fig<-ggplot(plotdf,aes(setting,gain,fill=setting))+geom_col(width=.7,colour="black",linewidth=.2)+
+  geom_hline(yintercept=0,linewidth=.3)+facet_wrap(~dataset,nrow=1)+
+  scale_fill_brewer(palette="Set2",guide="none")+
+  labs(x=NULL,y="CLR - raw AUC gain",title="MAGIC-CLR gain over raw scoring at deployable t settings (matched negatives)")+
+  theme_classic(base_size=10)+theme(axis.text.x=element_text(angle=25,hjust=1))
+ggsave(file.path(fig_dir,"fig_airtight_clr.png"),fig,width=10,height=4,dpi=220,bg="white")
+fig
+```

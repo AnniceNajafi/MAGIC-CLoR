@@ -1,0 +1,251 @@
+---
+title: "Tabula Muris marrow (10x droplet), third-dataset check of tolerant MCV"
+output: html_notebook
+---
+
+`magic_tolerant` (tolerance-regularised MCV, eps = 5%) was the one selector
+that beat upstream MAGIC on *both* benchmark datasets so far:
+
+| Method                     | Paul AUC | PBMC AUC | Mean |
+|----------------------------|----------|----------|------|
+| rmagic_auto (upstream)     | 0.971    | 0.846    | 0.909 |
+| cv_mcv vanilla (0:10)      | 0.973    | 0.856    | 0.914 |
+| **magic_tolerant (eps=5%)**  | 0.977    | 0.856    | 0.917 |
+
+Data: figshare droplet release (Tabula Muris v2), channel
+`Marrow-10X_P7_2`, extracted to
+`data/droplet/Marrow-10X_P7_2/{matrix.mtx,genes.tsv,barcodes.tsv}`.
+
+```{r setup, message=FALSE}
+suppressPackageStartupMessages({
+  library(cvMAGIC); library(Rmagic); library(Matrix); library(mclust)
+  library(pROC); library(ggplot2); library(dplyr); library(tidyr)
+  library(patchwork)
+})
+stopifnot(Rmagic::pymagic_is_available())
+stopifnot("magic_tolerant" %in% getNamespaceExports("cvMAGIC"))
+
+fig_dir  <- normalizePath(file.path("..", "figures"), mustWork = FALSE)
+data_dir <- normalizePath(file.path("..", "data"),    mustWork = FALSE)
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Load the 10x droplet marrow channel
+
+`genes.tsv` here carries the gene symbol in *both* columns (MGI symbols,
+identical to Paul's gene names), so no Ensembl-symbol mapping is needed.
+
+```{r load, message=FALSE}
+mtx_dir <- file.path(data_dir, "droplet", "Marrow-10X_P7_2")
+mat <- Matrix::readMM(file.path(mtx_dir, "matrix.mtx"))           # genes x cells
+genes <- read.table(file.path(mtx_dir, "genes.tsv"), sep = "\t",
+                    header = FALSE, stringsAsFactors = FALSE)
+rownames(mat) <- make.unique(genes$V1)
+colnames(mat) <- readLines(file.path(mtx_dir, "barcodes.tsv"))
+cat("Raw matrix:", nrow(mat), "genes x", ncol(mat), "cells\n")
+cat("Median UMIs/cell:", median(Matrix::colSums(mat)),
+    " | median genes/cell:", median(Matrix::colSums(mat > 0)), "\n")
+```
+
+## Filter + subsample (identical protocol to Paul / PBMC notebooks)
+
+```{r filter, message=FALSE}
+libsize   <- Matrix::colSums(mat)
+keep_cell <- libsize >= 500 & libsize <= quantile(libsize, 0.99)
+cat("Cells passing libsize filter:", sum(keep_cell), "/",
+    length(keep_cell), "\n")
+
+set.seed(101L)
+cell_idx <- sample(which(keep_cell), min(1500L, sum(keep_cell)))
+cnts <- mat[, cell_idx, drop = FALSE]
+
+# Mouse hematopoietic TF-target programme (same list as the Paul notebook).
+tf_targets <- list(
+  Gata1 = c("Klf1","Hba-a1","Hba-a2","Hbb-b1","Hbb-b2","Aqp1",
+            "Slc4a1","Gypa","Epor"),
+  Gata2 = c("Gata1","Klf1","Itga2b"),
+  Klf1  = c("Hba-a1","Hba-a2","Hbb-b1","Hbb-b2","Aqp1","Slc4a1"),
+  Sfpi1 = c("Cebpa","Mpo","Csf1r","Csf2ra","Csf2rb"),
+  Cebpa = c("Mpo","Elane","Prtn3","Ctsg","Csf3r"),
+  Cebpe = c("Mpo","Elane","Prtn3","Ctsg"),
+  Gfi1  = c("Csf1r","Elane"),
+  Irf8  = c("Cxcr4"),
+  Tal1  = c("Gata1","Klf1","Gata2"))
+must_keep <- intersect(unique(c(names(tf_targets), unlist(tf_targets))),
+                       rownames(cnts))
+
+# 10x-appropriate expression filter (>=3% of cells), then top-2000 HVG
+# unioned with the force-kept TF/target genes.
+gene_pos <- Matrix::rowMeans(cnts > 0)
+cnts <- cnts[gene_pos >= 0.03 | rownames(cnts) %in% must_keep, , drop = FALSE]
+gene_var <- apply(cnts, 1, function(x) var(as.numeric(x)))
+hv_idx <- order(gene_var, decreasing = TRUE)[seq_len(min(2000L, length(gene_var)))]
+keep_genes <- union(rownames(cnts)[hv_idx], must_keep)
+cnts <- cnts[keep_genes, , drop = FALSE]
+
+X <- as.matrix(t(cnts)); storage.mode(X) <- "integer"
+colnames(X) <- rownames(cnts); rownames(X) <- colnames(cnts)
+cat("Final matrix:", nrow(X), "cells x", ncol(X), "genes\n")
+present_tfs <- intersect(names(tf_targets), colnames(X))
+cat("TFs present:", length(present_tfs), "/", length(tf_targets),
+    "(", paste(present_tfs, collapse = ","), ")\n")
+rm(mat); invisible(gc())
+```
+
+## Scoring: TF-target Spearman-correlation ROC AUC
+
+Same scorer as the Paul and PBMC benchmarks: for each TF, positive pairs
+are its curated targets and negatives are 5x as many random non-target
+genes; the score is |Spearman| between imputed TF and gene; AUC is over
+the pooled pos/neg pairs.
+
+```{r score-fn}
+score_method <- function(imp_mat, tf_targets, gene_set) {
+  pos <- list(); neg <- list()
+  set.seed(7L)
+  for (tf in names(tf_targets)) {
+    if (!(tf %in% gene_set)) next
+    targets <- intersect(tf_targets[[tf]], gene_set)
+    if (length(targets) == 0L) next
+    pool <- setdiff(gene_set, c(tf, targets))
+    non_targets <- sample(pool, min(length(pool), 5L * length(targets)))
+    tf_vec <- imp_mat[, tf]
+    cor_pos <- abs(apply(imp_mat[, targets, drop = FALSE], 2, function(g)
+      suppressWarnings(cor(tf_vec, g, method = "spearman"))))
+    cor_neg <- abs(apply(imp_mat[, non_targets, drop = FALSE], 2, function(g)
+      suppressWarnings(cor(tf_vec, g, method = "spearman"))))
+    cor_pos[is.na(cor_pos)] <- 0; cor_neg[is.na(cor_neg)] <- 0
+    pos[[tf]] <- data.frame(score = cor_pos, label = 1L)
+    neg[[tf]] <- data.frame(score = cor_neg, label = 0L)
+  }
+  pairs <- rbind(do.call(rbind, pos), do.call(rbind, neg))
+  list(auc = as.numeric(pROC::roc(pairs$label, pairs$score,
+                                  levels = c(0L, 1L), direction = "<",
+                                  quiet = TRUE)$auc),
+       n_pos = sum(pairs$label == 1L), n_neg = sum(pairs$label == 0L))
+}
+
+impute_at <- function(X, t, npca = 20L, k = 30L) {
+  if (t == 0L) { out <- X } else {
+    g <- magic_graph(X, npca = npca, k = k)
+    out <- magic_impute(X, t = t, graph = g)
+  }
+  colnames(out) <- colnames(X); out
+}
+```
+
+## Oracle t-sweep: what does the AUC-vs-t curve look like here?
+
+This tells us the *regime*: a curve that rises with t (like Paul) means
+sparse data wants smoothing; a curve that peaks at t=0 (like PBMC) means
+dense data wants none. The tolerance rule's job is to track whichever it
+is.
+
+```{r sweep, message=FALSE}
+t_grid <- 0:10
+g_full <- magic_graph(X, npca = 20L, k = 30L)
+auc_by_t <- sapply(t_grid, function(t) {
+  imp <- if (t == 0L) X else magic_impute(X, t = t, graph = g_full)
+  colnames(imp) <- colnames(X)
+  score_method(imp, tf_targets, colnames(X))$auc
+})
+sweep_tbl <- data.frame(t = t_grid, AUC = auc_by_t)
+oracle_t <- t_grid[which.max(auc_by_t)]
+cat("AUC by global t:\n"); print(sweep_tbl, row.names = FALSE)
+cat(sprintf("Oracle (best global t) = %d, AUC = %.3f\n",
+            oracle_t, max(auc_by_t)))
+```
+
+## Head-to-head: upstream vs vanilla MCV vs tolerant MCV
+
+```{r methods, message=FALSE}
+auc_raw <- score_method(X, tf_targets, colnames(X))
+
+# upstream MAGIC, t = "auto"
+imp_rmagic <- as.matrix(Rmagic::magic(X, t = "auto", knn = 30L, npca = 20L,
+                                      verbose = 0)$result)
+colnames(imp_rmagic) <- colnames(X)
+auc_rmagic <- score_method(imp_rmagic, tf_targets, colnames(X))$auc
+
+# vanilla cv_mcv (argmin of MCV loss, search 0:10)
+van <- mcv_select_t(X, t_values = 0:10, npca = 20L, k = 30L, seed = 1L)
+auc_van <- score_method(impute_at(X, van$t), tf_targets, colnames(X))$auc
+
+# shipped tolerant MCV (eps = 5%)
+tol <- magic_tolerant(X, t_values = 0:10, tolerance = 0.05,
+                      npca = 20L, k = 30L, seed = 1L)
+imp_tol <- tol$imputed; colnames(imp_tol) <- colnames(X)
+auc_tol <- score_method(imp_tol, tf_targets, colnames(X))$auc
+
+summary_df <- data.frame(
+  method = c("raw", "rmagic_auto", "cv_mcv (vanilla)", "magic_tolerant"),
+  t      = c(NA, NA, van$t, tol$t),
+  AUC    = c(auc_raw$auc, auc_rmagic, auc_van, auc_tol))
+
+cat(sprintf("\nTabula Muris marrow (10x) TF-target AUC  (%d pos / %d neg pairs)\n",
+            auc_raw$n_pos, auc_raw$n_neg))
+print(summary_df, row.names = FALSE)
+cat(sprintf("\nMCV argmin t = %d ; tolerant t = %d ; oracle t = %d\n",
+            van$t, tol$t, oracle_t))
+cat(sprintf("tolerant vs upstream rmagic_auto: %+.3f AUC\n",
+            auc_tol - auc_rmagic))
+cat(sprintf("tolerant vs vanilla cv_mcv:       %+.3f AUC\n",
+            auc_tol - auc_van))
+```
+
+## Figure
+
+```{r figure, fig.width = 9, fig.height = 4}
+p_sweep <- ggplot(sweep_tbl, aes(t, AUC)) +
+  geom_line(linewidth = 0.8, colour = "grey40") +
+  geom_point(size = 2, colour = "grey40") +
+  geom_point(data = subset(sweep_tbl, t == van$t),
+             aes(colour = "vanilla MCV argmin"), size = 4) +
+  geom_point(data = subset(sweep_tbl, t == tol$t),
+             aes(colour = "tolerant MCV (eps=5%)"), size = 3) +
+  geom_point(data = subset(sweep_tbl, t == oracle_t),
+             aes(colour = "oracle"), size = 2) +
+  scale_colour_manual(values = c("vanilla MCV argmin" = "#1f77b4",
+                                 "tolerant MCV (eps=5%)" = "#2ca02c",
+                                 "oracle" = "#d62728"), name = NULL) +
+  scale_x_continuous(breaks = t_grid) +
+  labs(x = "global diffusion time t", y = "TF-target AUC",
+       title = "(a) AUC-vs-t and where each selector lands") +
+  theme_classic(base_size = 10) + theme(legend.position = "bottom")
+
+bar_df <- summary_df
+bar_df$method <- factor(bar_df$method,
+  levels = c("raw", "rmagic_auto", "cv_mcv (vanilla)", "magic_tolerant"))
+p_bar <- ggplot(bar_df, aes(method, AUC, fill = method)) +
+  geom_col(width = 0.6, colour = "black", linewidth = 0.25) +
+  geom_text(aes(label = ifelse(is.na(t), sprintf("%.3f", AUC),
+                               sprintf("%.3f\n(t=%d)", AUC, t))),
+            vjust = -0.15, size = 3, lineheight = 0.85) +
+  scale_fill_manual(values = c("raw" = "grey70",
+                               "rmagic_auto" = "#ff7f0e",
+                               "cv_mcv (vanilla)" = "#1f77b4",
+                               "magic_tolerant" = "#2ca02c"), guide = "none") +
+  coord_cartesian(ylim = c(min(bar_df$AUC) - 0.02, max(bar_df$AUC) + 0.02)) +
+  labs(x = NULL, y = "TF-target ROC AUC",
+       title = "(b) Tabula Muris marrow: head-to-head") +
+  theme_classic(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+fig <- p_sweep + p_bar + plot_layout(widths = c(1, 1))
+ggsave(file.path(fig_dir, "fig_tabula_muris.png"), fig,
+       width = 9, height = 4.2, dpi = 220, bg = "white")
+fig
+```
+
+## Caveats
+
+* Single channel (`Marrow-10X_P7_2`, ~1500 cells after subsampling).
+  `Marrow-10X_P7_3` is extracted alongside and can be pooled or used as a
+  replicate if a second run is wanted.
+* Same scoring caveats as Paul/PBMC: the TF-target list is small and
+  curated from lineage biology, not a ChIP-seq ground truth; absolute
+  AUCs are comparative, not absolute.
+* ARI-vs-raw clustering is omitted here (the TF-target AUC is the metric
+  the tolerance rule was designed against); add it back if a cluster-
+  preservation cross-check is wanted.
+```
