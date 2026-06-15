@@ -1,0 +1,347 @@
+---
+title: "10x PBMC 3k - second-dataset validation of per-gene Pearson MCV"
+output: html_notebook
+---
+
+The Paul 2015 benchmark (`paul_realdata.Rmd`, `per_gene_comparison.Rmd`)
+showed that `magic_per_gene` with Pearson-residual MCV loss beats both
+`cv_mcv` (current cvMAGIC best) and upstream `rmagic_auto` on
+hematopoietic TF-target prediction. That result needs replication on an
+independent dataset before it can anchor the article.
+
+This notebook re-runs the same comparison on **10x PBMC 3k** - a
+canonical, completely reproducible peripheral-blood dataset with
+entirely different biology (mature immune cells: T, B, NK, monocytes,
+DCs) and a different platform (10x Chromium v1 vs MARS-seq). If the
+per-gene Pearson lift transfers from progenitor hematopoiesis to mature
+PBMC immune lineages, that's strong evidence it is not Paul-specific.
+
+```{r setup, message=FALSE}
+suppressPackageStartupMessages({
+  library(cvMAGIC)
+  library(Rmagic)
+  library(Matrix)
+  library(Seurat)
+  library(mclust)
+  library(pROC)
+  library(ggplot2)
+  library(dplyr)
+  library(patchwork)
+})
+stopifnot(Rmagic::pymagic_is_available())
+stopifnot("magic_per_gene" %in% getNamespaceExports("cvMAGIC"))
+
+fig_dir  <- normalizePath(file.path("..", "figures"), mustWork = FALSE)
+data_dir <- normalizePath(file.path("..", "data"),    mustWork = FALSE)
+dir.create(fig_dir,  showWarnings = FALSE, recursive = TRUE)
+```
+
+## Load 10x mtx
+
+The 10x v1 PBMC 3k filtered matrices were downloaded by the parent
+session to `data/filtered_gene_bc_matrices/hg19/` (sources:
+matrix.mtx, genes.tsv, barcodes.tsv). 32,738 genes x 2,700 cells.
+
+```{r load, message=FALSE}
+mtx_dir <- file.path(data_dir, "filtered_gene_bc_matrices", "hg19")
+mat <- Matrix::readMM(file.path(mtx_dir, "matrix.mtx"))   # genes x cells
+genes <- read.table(file.path(mtx_dir, "genes.tsv"), sep = "\t",
+                    header = FALSE, stringsAsFactors = FALSE)
+barcodes <- readLines(file.path(mtx_dir, "barcodes.tsv"))
+
+# 10x v1 genes.tsv: ENSG_id<TAB>symbol. Use symbols; collapse duplicates
+# by summing rows (very rare).
+gene_symbol <- genes$V2
+rownames(mat) <- make.unique(gene_symbol)
+colnames(mat) <- barcodes
+dim(mat)
+```
+
+## Filter cells and genes
+
+```{r filter, message=FALSE}
+libsize <- Matrix::colSums(mat)
+keep_cell <- libsize >= 500 & libsize <= quantile(libsize, 0.99)
+cat("Cells passing libsize filter:", sum(keep_cell), "/",
+    length(keep_cell), "\n")
+
+# Subsample for tractable run-time (matches Paul setup).
+set.seed(101L)
+n_cells_keep <- 1500L
+cell_idx <- sample(which(keep_cell), min(n_cells_keep, sum(keep_cell)))
+cnts <- mat[, cell_idx, drop = FALSE]
+
+# Genes expressed in >= 3% of cells (lower than Paul's 5% because PBMC
+# has sparser lineage-defining markers like FOXP3 / TBX21).
+gene_pos_frac <- Matrix::rowMeans(cnts > 0)
+cnts <- cnts[gene_pos_frac >= 0.03, , drop = FALSE]
+
+# Force-keep important TFs even if filtered out by variance step below.
+must_keep <- c(
+  "PAX5","TBX21","EOMES","GATA3","FOXP3","SPI1","IRF8","CEBPB",
+  "LEF1","KLF2","ID3","RUNX3","TCF7","BATF","BCL11A","BCL11B",
+  "CD19","MS4A1","CD79A","CD79B","BLNK","BANK1",
+  "IFNG","GZMB","GZMA","CXCR3","GNLY","PRF1","NKG7","KLRD1",
+  "IL7R","IL2RA","CTLA4","TNFRSF18",
+  "CD14","LYZ","CSF1R","FCGR3A","CST3","S100A8","S100A9","HLA-DRA",
+  "CCR7","SELL","S1PR1","FLT3"
+)
+must_keep <- intersect(must_keep, rownames(cnts))
+
+# Pick top high-variance genes (~2000) and union with must_keep.
+gene_var <- apply(cnts, 1, function(x) var(as.numeric(x)))
+n_genes_keep <- 2000L
+hv_idx <- order(gene_var, decreasing = TRUE)[seq_len(
+  min(n_genes_keep, length(gene_var)))]
+keep_genes <- union(rownames(cnts)[hv_idx], must_keep)
+cnts <- cnts[keep_genes, , drop = FALSE]
+
+# Transpose to cells x genes (cvMAGIC convention) and densify.
+X <- as.matrix(t(cnts))
+storage.mode(X) <- "integer"
+cat("Final matrix:", nrow(X), "cells x", ncol(X), "genes\n")
+cat("Must-keep TFs present:",
+    sum(c("PAX5","TBX21","EOMES","FOXP3","SPI1","IRF8","LEF1","KLF2") %in%
+        colnames(X)), "/ 8\n")
+```
+
+## Run the five methods
+
+```{r impute, message=FALSE}
+NPCA <- 20L; K <- 30L
+results <- list()
+
+t_start <- Sys.time()
+sel <- mcv_select_t(X, t_values = 1:10, npca = NPCA, k = K, seed = 1L)
+g_full <- magic_graph(X, npca = NPCA, k = K)
+results$cv_mcv <- list(
+  imp = magic_impute(X, t = sel$t, graph = g_full),
+  t   = sel$t)
+cat(sprintf("cv_mcv               t = %d  (%.1fs)\n", sel$t,
+            as.numeric(difftime(Sys.time(), t_start, units = "secs"))))
+
+t_step <- Sys.time()
+out <- magic_modules(X, n_modules = 8L, t_values = 1:10,
+                     npca = NPCA, k = K, seed = 1L)
+results$cv_per_module <- list(imp = out$imputed, t = out$t_per_module)
+cat(sprintf("cv_per_module        t = %s  (%.1fs)\n",
+            paste(out$t_per_module, collapse = ","),
+            as.numeric(difftime(Sys.time(), t_step, units = "secs"))))
+
+t_step <- Sys.time()
+out <- magic_per_gene(X, t_values = 1:10, loss = "mse",
+                      npca = NPCA, k = K, seed = 1L)
+results$cv_per_gene_mse <- list(imp = out$imputed, t = out$t_per_gene)
+cat(sprintf("cv_per_gene_mse      median t = %d  (%.1fs)\n",
+            median(out$t_per_gene),
+            as.numeric(difftime(Sys.time(), t_step, units = "secs"))))
+
+t_step <- Sys.time()
+out <- magic_per_gene(X, t_values = 1:10, loss = "pearson",
+                      npca = NPCA, k = K, seed = 1L)
+results$cv_per_gene_pearson <- list(imp = out$imputed, t = out$t_per_gene)
+cat(sprintf("cv_per_gene_pearson  median t = %d  (%.1fs)\n",
+            median(out$t_per_gene),
+            as.numeric(difftime(Sys.time(), t_step, units = "secs"))))
+
+t_step <- Sys.time()
+out <- Rmagic::magic(X, t = "auto", knn = K, npca = NPCA, verbose = 0)
+results$rmagic_auto <- list(imp = as.matrix(out$result), t = NA)
+cat(sprintf("rmagic_auto          t = auto  (%.1fs)\n",
+            as.numeric(difftime(Sys.time(), t_step, units = "secs"))))
+
+# Attach colnames so we can index by gene symbol below.
+for (m in names(results)) colnames(results[[m]]$imp) <- colnames(X)
+```
+
+## PBMC TF-target list
+
+Curated from canonical immune-lineage TF biology (Sci. text: Pang &
+Murphy 2010, Vahedi et al. 2013, Hu & Chen 2013; literature reviews
+of PAX5/TBX21/EOMES/SPI1/IRF8). All TFs and at least one target must
+be present in the variable-gene set; pairs failing intersection are
+silently dropped.
+
+```{r tf-targets}
+tf_targets <- list(
+  # B-cell program
+  PAX5  = c("CD19","MS4A1","CD79A","CD79B","BLNK","BANK1","BCL11A"),
+  # Th1 / CD8 effector
+  TBX21 = c("IFNG","GZMB","CXCR3","GNLY","PRF1","NKG7"),
+  EOMES = c("IFNG","GZMA","PRF1","GNLY","NKG7","KLRD1"),
+  # Treg
+  FOXP3 = c("IL2RA","CTLA4","TNFRSF18"),
+  # Myeloid
+  SPI1  = c("CD14","LYZ","CSF1R","FCGR3A","CST3","S100A8","S100A9"),
+  IRF8  = c("CCR7","FLT3","CST3","HLA-DRA"),
+  CEBPB = c("CD14","LYZ","S100A8","S100A9"),
+  # Naive T quiescence
+  LEF1  = c("SELL","CCR7","TCF7"),
+  KLF2  = c("SELL","S1PR1","CCR7"),
+  ID3   = c("SELL","CCR7")
+)
+
+gene_set <- colnames(X)
+score_method <- function(imp_mat) {
+  pos <- list(); neg <- list()
+  set.seed(7L)
+  for (tf in names(tf_targets)) {
+    if (!(tf %in% gene_set)) next
+    targets <- intersect(tf_targets[[tf]], gene_set)
+    if (length(targets) == 0L) next
+    pool <- setdiff(gene_set, c(tf, targets))
+    non_targets <- sample(pool, min(length(pool), 5L * length(targets)))
+    tf_vec <- imp_mat[, tf]
+    cor_pos <- abs(apply(imp_mat[, targets, drop = FALSE], 2, function(g)
+      suppressWarnings(cor(tf_vec, g, method = "spearman"))))
+    cor_neg <- abs(apply(imp_mat[, non_targets, drop = FALSE], 2, function(g)
+      suppressWarnings(cor(tf_vec, g, method = "spearman"))))
+    cor_pos[is.na(cor_pos)] <- 0
+    cor_neg[is.na(cor_neg)] <- 0
+    pos[[tf]] <- data.frame(score = cor_pos, label = 1L)
+    neg[[tf]] <- data.frame(score = cor_neg, label = 0L)
+  }
+  pairs <- rbind(do.call(rbind, pos), do.call(rbind, neg))
+  list(
+    auc = as.numeric(pROC::roc(pairs$label, pairs$score,
+                               levels = c(0L, 1L), direction = "<",
+                               quiet = TRUE)$auc),
+    n_pos = sum(pairs$label == 1L),
+    n_neg = sum(pairs$label == 0L))
+}
+
+# Sanity: how many TFs survive into the variable-gene set?
+present_tfs <- intersect(names(tf_targets), gene_set)
+cat("TFs in variable-gene set:", length(present_tfs), "/",
+    length(tf_targets), "(", paste(present_tfs, collapse=","), ")\n")
+```
+
+## Cluster preservation (ARI vs raw)
+
+```{r cluster, message=FALSE}
+cluster_louvain <- function(mat, npca = 20L, k_param = 20L, res = 0.6) {
+  rownames(mat) <- paste0("cell", seq_len(nrow(mat)))
+  colnames(mat) <- paste0("g",   seq_len(ncol(mat)))
+  obj <- CreateSeuratObject(counts = t(mat), assay = "RNA")
+  obj <- SetAssayData(obj, assay = "RNA", layer = "data",
+                      new.data = log1p(t(mat)))
+  VariableFeatures(obj) <- colnames(mat)
+  obj <- ScaleData(obj, verbose = FALSE)
+  obj <- RunPCA(obj, npcs = npca, verbose = FALSE,
+                features = VariableFeatures(obj))
+  obj <- FindNeighbors(obj, dims = seq_len(npca), k.param = k_param,
+                       verbose = FALSE)
+  obj <- FindClusters(obj, resolution = res, verbose = FALSE,
+                      random.seed = 1L)
+  as.integer(as.character(Idents(obj)))
+}
+cl_raw <- cluster_louvain(X)
+cl_each <- lapply(results, function(r) cluster_louvain(r$imp))
+ari <- sapply(cl_each, adjustedRandIndex, cl_raw)
+```
+
+## Score all methods
+
+```{r score}
+auc_raw <- score_method(X)
+auc_each <- lapply(results, function(r) score_method(r$imp))
+
+cat(sprintf("\nPBMC 3k TF-target AUC\n"))
+cat(sprintf("  raw                 %.3f  (%d pos, %d neg pairs)\n",
+            auc_raw$auc, auc_raw$n_pos, auc_raw$n_neg))
+for (m in names(auc_each))
+  cat(sprintf("  %-19s %.3f\n", m, auc_each[[m]]$auc))
+
+summary_tbl <- data.frame(
+  method   = names(results),
+  n_clust  = sapply(cl_each, function(c) length(unique(c))),
+  ARI_raw  = ari,
+  AUC      = sapply(auc_each, function(x) x$auc))
+print(summary_tbl, row.names = FALSE)
+```
+
+## Per-gene t distribution
+
+```{r t-dist, fig.width = 7, fig.height = 2.6}
+t_pg_mse     <- results$cv_per_gene_mse$t
+t_pg_pearson <- results$cv_per_gene_pearson$t
+t_df <- data.frame(
+  method = factor(rep(c("per-gene MSE", "per-gene Pearson"),
+                      times = c(length(t_pg_mse), length(t_pg_pearson))),
+                  levels = c("per-gene MSE", "per-gene Pearson")),
+  t      = c(t_pg_mse, t_pg_pearson))
+ggplot(t_df, aes(t, fill = method)) +
+  geom_bar(width = 0.7, colour = "black", linewidth = 0.2) +
+  facet_wrap(~ method) +
+  scale_fill_manual(values = c("per-gene MSE"     = "#1f77b4",
+                               "per-gene Pearson" = "#2ca02c"),
+                    guide = "none") +
+  labs(x = "Per-gene optimal t", y = "number of genes",
+       title = "PBMC 3k: distribution of per-gene t*") +
+  theme_classic(base_size = 9)
+```
+
+## Comparison figure
+
+```{r figure, fig.width = 9, fig.height = 3.6}
+plot_df <- summary_tbl
+plot_df$method <- factor(plot_df$method,
+  levels = c("rmagic_auto", "cv_mcv", "cv_per_module",
+             "cv_per_gene_mse", "cv_per_gene_pearson"))
+plot_df <- plot_df[order(plot_df$method), ]
+
+palette_all <- c(
+  "rmagic_auto"         = "#ff7f0e",
+  "cv_mcv"              = "#1f77b4",
+  "cv_per_module"       = "#5fa8d3",
+  "cv_per_gene_mse"     = "#2ca02c",
+  "cv_per_gene_pearson" = "#8ed18a")
+
+p_ari <- ggplot(plot_df, aes(method, ARI_raw, fill = method)) +
+  geom_col(width = 0.6, colour = "black", linewidth = 0.25) +
+  geom_text(aes(label = sprintf("%.3f", ARI_raw)),
+            vjust = -0.4, size = 3) +
+  scale_fill_manual(values = palette_all, guide = "none") +
+  scale_y_continuous(limits = c(0, max(plot_df$ARI_raw) * 1.18),
+                     expand = c(0, 0)) +
+  labs(x = NULL, y = "ARI (vs raw clustering)",
+       title = "(a) PBMC 3k: cluster preservation") +
+  theme_classic(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+p_auc <- ggplot(plot_df, aes(method, AUC, fill = method)) +
+  geom_col(width = 0.6, colour = "black", linewidth = 0.25) +
+  geom_hline(yintercept = auc_raw$auc, linetype = "dashed",
+             colour = "grey50") +
+  annotate("text", x = 0.6, y = auc_raw$auc + 0.005,
+           label = sprintf("raw = %.3f", auc_raw$auc),
+           hjust = 0, size = 3, colour = "grey30") +
+  geom_text(aes(label = sprintf("%.3f", AUC)),
+            vjust = -0.4, size = 3) +
+  scale_fill_manual(values = palette_all, guide = "none") +
+  coord_cartesian(ylim = c(min(plot_df$AUC, auc_raw$auc) - 0.02,
+                           max(plot_df$AUC) + 0.015)) +
+  labs(x = NULL, y = "ROC AUC",
+       title = "(b) PBMC 3k: TF-target prediction") +
+  theme_classic(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+fig <- p_ari + p_auc + plot_layout(widths = c(1, 1.25))
+ggsave(file.path(fig_dir, "fig_pbmc_realdata.png"), fig,
+       width = 9, height = 3.6, dpi = 220, bg = "white")
+fig
+```
+
+## Caveats
+
+* As with the Paul benchmark, ARI is measured against the **raw**
+  clustering, not against ground-truth cell-type labels. The 10x PBMC
+  3k tutorial labels (CD14+ Mono, CD4 T, CD8 T, B, NK, DC, etc.) could
+  be substituted in if a stronger reference is wanted.
+* The TF-target list is small (10 TFs, ~40 pairs) and emphasises
+  lineage-defining relationships. It is *not* a curated PBMC-specific
+  ChIP-seq database; results would be more reliable against TRRUST or
+  DoRothEA confidence-A interactions. Treat absolute AUCs as
+  comparative not absolute.
+* Cells were subsampled to 1500 / 2700 to match the Paul setup. The
+  full 2700-cell matrix would run in <2x time.

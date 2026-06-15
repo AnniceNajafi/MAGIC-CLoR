@@ -1,0 +1,370 @@
+---
+title: "Per-gene adaptive t: does removing the clustering step help?"
+output: html_notebook
+---
+
+The article's per-module variant (`magic_modules`) groups genes via k-means
+on PC-projected expression profiles, then picks a single $t$ per cluster
+from the *averaged* per-gene MCV losses inside that cluster. On every test
+we have run it has either tied or slightly trailed global MCV.
+
+This notebook tests a simpler alternative: **per-gene adaptive $t$**. We
+still compute the per-gene MCV loss curve (via the same `mcv_per_gene`
+internal as `magic_modules`), but we skip the clustering and the
+within-cluster averaging entirely - each gene gets its own $t^\star_g =
+\arg\min_t \mathcal{L}_g(t)$. Two MCV loss flavours are compared:
+
+* **MSE** - the standard count-scale Batson loss.
+* **Pearson** - squared standardised residuals $(B - \hat\mu)^2 /
+  \max(\hat\mu, \varepsilon)$, scale-invariant per gene.
+
+Tests:
+
+1. Synthetic *mixed-scale* regime (the regime that motivated per-module
+   in the first place: gene groups with mean-expression scales $1:5:20$).
+2. Paul 2015 bone-marrow data (`paul_realdata.Rmd` setup).
+
+```{r setup, message=FALSE}
+suppressPackageStartupMessages({
+  library(cvMAGIC)
+  library(Rmagic)
+  library(Matrix)
+  library(Seurat)
+  library(mclust)
+  library(pROC)
+  library(ggplot2)
+  library(dplyr)
+  library(patchwork)
+})
+
+fig_dir  <- normalizePath(file.path("..", "figures"), mustWork = FALSE)
+data_dir <- normalizePath(file.path("..", "data"),    mustWork = FALSE)
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+stopifnot("magic_per_gene" %in% getNamespaceExports("cvMAGIC"))
+```
+
+## Part 1 - synthetic mixed-scale regime
+
+```{r synthetic}
+make_mixed_counts <- function(n_cells, n_genes, n_clusters, n_groups,
+                              scales, seed, libsize = 1500) {
+  set.seed(seed)
+  stopifnot(n_genes %% n_groups == 0)
+  per_group <- n_genes %/% n_groups
+  group <- rep(seq_len(n_groups), each = per_group)
+  labels <- sample.int(n_clusters, n_cells, replace = TRUE)
+  cent <- matrix(0.1, nrow = n_clusters, ncol = n_genes)
+  for (g in seq_len(n_groups)) {
+    gcols <- which(group == g)
+    for (c in seq_len(n_clusters)) {
+      sg <- sample(gcols, per_group %/% n_clusters)
+      cent[c, sg] <- runif(length(sg), 2, 5) * scales[g]
+    }
+  }
+  lam <- cent[labels, , drop = FALSE]
+  lam <- lam / rowSums(lam) * libsize
+  counts <- matrix(rpois(n_cells * n_genes, lam), n_cells, n_genes)
+  list(counts = counts, lambda = lam, labels = labels, group = group)
+}
+
+mse <- function(a, b) mean((a - b)^2)
+
+NPCA <- 14L; K <- 22L
+d <- make_mixed_counts(300L, 120L, 3L, 3L,
+                       scales = c(0.3, 1.5, 6.0), seed = 101L)
+```
+
+```{r synthetic-methods, message=FALSE}
+results_syn <- list()
+
+# cv_mcv (global)
+sel <- mcv_select_t(d$counts, t_values = 1:12,
+                    npca = NPCA, k = K, seed = 1L)
+g <- magic_graph(d$counts, npca = NPCA, k = K)
+imp <- magic_impute(d$counts, t = sel$t, graph = g)
+results_syn$cv_mcv <- list(imp = imp, t = sel$t)
+
+# cv_per_module
+out <- magic_modules(d$counts, n_modules = 6L, t_values = 1:12,
+                     npca = NPCA, k = K, seed = 1L)
+results_syn$cv_per_module <- list(imp = out$imputed,
+                                  t = out$t_per_module)
+
+# cv_per_gene (MSE)
+out <- magic_per_gene(d$counts, t_values = 1:12, loss = "mse",
+                      npca = NPCA, k = K, seed = 1L)
+results_syn$cv_per_gene_mse <- list(imp = out$imputed,
+                                    t = out$t_per_gene)
+
+# cv_per_gene (Pearson)
+out <- magic_per_gene(d$counts, t_values = 1:12, loss = "pearson",
+                      npca = NPCA, k = K, seed = 1L)
+results_syn$cv_per_gene_pearson <- list(imp = out$imputed,
+                                        t = out$t_per_gene)
+
+# rmagic_auto
+X <- d$counts; colnames(X) <- paste0("g", seq_len(ncol(X)))
+out <- Rmagic::magic(X, t = "auto", knn = K, npca = NPCA, verbose = 0)
+results_syn$rmagic_auto <- list(imp = as.matrix(out$result), t = NA)
+
+syn_table <- data.frame(
+  method = names(results_syn),
+  mse    = sapply(results_syn, function(r) mse(r$imp, d$lambda)),
+  median_t = sapply(results_syn, function(r)
+    if (length(r$t) > 1) median(r$t, na.rm = TRUE) else r$t)
+)
+print(syn_table, row.names = FALSE)
+```
+
+The MSE here is what we want to minimise. Per-module ties global MCV;
+per-gene (either flavour) is the test.
+
+## Part 2 - Paul 2015 real-data
+
+Re-runs the same comparison on the Paul bone-marrow subset used in
+`paul_realdata.Rmd`. Data download is cached at `../data/`.
+
+```{r paul-load, message=FALSE}
+url      <- "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE72nnn/GSE72857/suppl/GSE72857_umitab.txt.gz"
+gz_path  <- file.path(data_dir, "GSE72857_umitab.txt.gz")
+txt_path <- file.path(data_dir, "GSE72857_umitab.txt")
+if (!file.exists(gz_path))  {
+  options(timeout = 600); utils::download.file(url, gz_path, mode = "wb",
+                                               quiet = TRUE)
+}
+if (!file.exists(txt_path)) R.utils::gunzip(gz_path, destname = txt_path,
+                                            remove = FALSE)
+
+counts_full <- data.table::fread(txt_path, sep = "\t",
+                                 header = TRUE, data.table = FALSE)
+gene_names  <- counts_full[[1]]
+counts_full <- as.matrix(counts_full[, -1, drop = FALSE])
+rownames(counts_full) <- gene_names
+
+libsize    <- colSums(counts_full)
+keep_cell  <- libsize >= 500 & libsize <= quantile(libsize, 0.99)
+set.seed(101L)
+cell_idx   <- sample(which(keep_cell), 1500L)
+cnts       <- counts_full[, cell_idx]
+gene_pos   <- rowMeans(cnts > 0)
+cnts       <- cnts[gene_pos >= 0.05, ]
+gene_var   <- apply(cnts, 1, var)
+gene_idx   <- order(gene_var, decreasing = TRUE)[seq_len(2000L)]
+cnts       <- cnts[gene_idx, ]
+
+X <- t(cnts)
+storage.mode(X) <- "integer"
+colnames(X) <- rownames(cnts)
+rownames(X) <- colnames(cnts)
+dim(X)
+```
+
+```{r paul-methods, message=FALSE}
+NPCA_P <- 20L; K_P <- 30L
+results_paul <- list()
+
+# cv_mcv
+sel <- mcv_select_t(X, t_values = 1:10,
+                    npca = NPCA_P, k = K_P, seed = 1L)
+g <- magic_graph(X, npca = NPCA_P, k = K_P)
+results_paul$cv_mcv <- list(imp = magic_impute(X, t = sel$t, graph = g),
+                            t = sel$t)
+
+# cv_per_module
+out <- magic_modules(X, n_modules = 8L, t_values = 1:10,
+                     npca = NPCA_P, k = K_P, seed = 1L)
+results_paul$cv_per_module <- list(imp = out$imputed,
+                                   t = out$t_per_module)
+
+# cv_per_gene (MSE)
+out <- magic_per_gene(X, t_values = 1:10, loss = "mse",
+                      npca = NPCA_P, k = K_P, seed = 1L)
+results_paul$cv_per_gene_mse <- list(imp = out$imputed,
+                                     t = out$t_per_gene)
+
+# cv_per_gene (Pearson)
+out <- magic_per_gene(X, t_values = 1:10, loss = "pearson",
+                      npca = NPCA_P, k = K_P, seed = 1L)
+results_paul$cv_per_gene_pearson <- list(imp = out$imputed,
+                                         t = out$t_per_gene)
+
+# rmagic_auto
+out <- Rmagic::magic(X, t = "auto", knn = K_P, npca = NPCA_P, verbose = 0)
+results_paul$rmagic_auto <- list(imp = as.matrix(out$result), t = NA)
+
+# attach colnames
+for (m in names(results_paul))
+  colnames(results_paul[[m]]$imp) <- colnames(X)
+```
+
+```{r paul-t-distribution, fig.width = 7, fig.height = 2.6}
+t_pg_mse     <- results_paul$cv_per_gene_mse$t
+t_pg_pearson <- results_paul$cv_per_gene_pearson$t
+t_df <- data.frame(
+  method = factor(rep(c("per-gene MSE", "per-gene Pearson"),
+                      times = c(length(t_pg_mse), length(t_pg_pearson))),
+                  levels = c("per-gene MSE", "per-gene Pearson")),
+  t      = c(t_pg_mse, t_pg_pearson)
+)
+
+ggplot(t_df, aes(t, fill = method)) +
+  geom_bar(width = 0.7, colour = "black", linewidth = 0.2) +
+  facet_wrap(~ method) +
+  scale_fill_manual(values = c("per-gene MSE" = "#1f77b4",
+                               "per-gene Pearson" = "#2ca02c"),
+                    guide = "none") +
+  labs(x = "Per-gene optimal t", y = "number of genes",
+       title = "Distribution of per-gene t* on Paul 2015") +
+  theme_classic(base_size = 9)
+```
+
+```{r paul-cluster}
+cluster_louvain <- function(mat, npca = 20L, k_param = 20L, res = 0.6) {
+  rownames(mat) <- paste0("cell", seq_len(nrow(mat)))
+  colnames(mat) <- paste0("g",   seq_len(ncol(mat)))
+  obj <- CreateSeuratObject(counts = t(mat), assay = "RNA")
+  obj <- SetAssayData(obj, assay = "RNA", layer = "data",
+                      new.data = log1p(t(mat)))
+  VariableFeatures(obj) <- colnames(mat)
+  obj <- ScaleData(obj, verbose = FALSE)
+  obj <- RunPCA(obj, npcs = npca, verbose = FALSE,
+                features = VariableFeatures(obj))
+  obj <- FindNeighbors(obj, dims = seq_len(npca), k.param = k_param,
+                       verbose = FALSE)
+  obj <- FindClusters(obj, resolution = res, verbose = FALSE,
+                      random.seed = 1L)
+  as.integer(as.character(Idents(obj)))
+}
+cl_raw <- cluster_louvain(X)
+cl_each <- lapply(results_paul, function(r) cluster_louvain(r$imp))
+ari <- sapply(cl_each, adjustedRandIndex, cl_raw)
+```
+
+```{r paul-tf-auc}
+tf_targets <- list(
+  Gata1 = c("Klf1","Hba-a1","Hba-a2","Hbb-b1","Hbb-b2","Aqp1",
+            "Slc4a1","Gypa","Epor"),
+  Gata2 = c("Gata1","Klf1","Itga2b"),
+  Klf1  = c("Hba-a1","Hba-a2","Hbb-b1","Hbb-b2","Aqp1","Slc4a1"),
+  Sfpi1 = c("Cebpa","Mpo","Csf1r","Csf2ra","Csf2rb"),
+  Cebpa = c("Mpo","Elane","Prtn3","Ctsg","Csf3r"),
+  Cebpe = c("Mpo","Elane","Prtn3","Ctsg"),
+  Gfi1  = c("Csf1r","Elane"),
+  Irf8  = c("Cxcr4"),
+  Tal1  = c("Gata1","Klf1","Gata2")
+)
+gene_set <- colnames(X)
+score_method <- function(imp_mat) {
+  pos <- list(); neg <- list()
+  set.seed(7L)
+  for (tf in names(tf_targets)) {
+    if (!(tf %in% gene_set)) next
+    targets <- intersect(tf_targets[[tf]], gene_set)
+    if (length(targets) == 0L) next
+    pool <- setdiff(gene_set, c(tf, targets))
+    non_targets <- sample(pool, min(length(pool), 5L * length(targets)))
+    tf_vec <- imp_mat[, tf]
+    cor_pos <- abs(apply(imp_mat[, targets, drop = FALSE], 2, function(g)
+      suppressWarnings(cor(tf_vec, g, method = "spearman"))))
+    cor_neg <- abs(apply(imp_mat[, non_targets, drop = FALSE], 2, function(g)
+      suppressWarnings(cor(tf_vec, g, method = "spearman"))))
+    cor_pos[is.na(cor_pos)] <- 0
+    cor_neg[is.na(cor_neg)] <- 0
+    pos[[tf]] <- data.frame(score = cor_pos, label = 1L)
+    neg[[tf]] <- data.frame(score = cor_neg, label = 0L)
+  }
+  pairs <- rbind(do.call(rbind, pos), do.call(rbind, neg))
+  as.numeric(pROC::roc(pairs$label, pairs$score,
+                       levels = c(0L, 1L), direction = "<",
+                       quiet = TRUE)$auc)
+}
+aucs <- c(raw = score_method(X),
+          sapply(results_paul, function(r) score_method(r$imp)))
+```
+
+```{r paul-summary}
+paul_table <- data.frame(
+  method   = names(results_paul),
+  n_clust  = sapply(cl_each, function(c) length(unique(c))),
+  ARI_raw  = ari,
+  AUC      = aucs[names(results_paul)]
+)
+cat("Raw AUC = ", round(aucs["raw"], 3), "\n", sep = "")
+print(paul_table, row.names = FALSE)
+```
+
+## Combined comparison figure
+
+```{r combined-figure, fig.width = 10, fig.height = 6.8}
+syn_plot <- syn_table |>
+  mutate(method = factor(method,
+                         levels = c("rmagic_auto", "cv_mcv",
+                                    "cv_per_module",
+                                    "cv_per_gene_mse",
+                                    "cv_per_gene_pearson"))) |>
+  arrange(method)
+
+palette_all <- c(
+  "rmagic_auto"        = "#ff7f0e",
+  "cv_mcv"             = "#1f77b4",
+  "cv_per_module"      = "#5fa8d3",
+  "cv_per_gene_mse"    = "#2ca02c",
+  "cv_per_gene_pearson"= "#8ed18a"
+)
+
+p_syn <- ggplot(syn_plot, aes(method, mse, fill = method)) +
+  geom_col(width = 0.6, colour = "black", linewidth = 0.25) +
+  geom_text(aes(label = sprintf("%.3f", mse)),
+            vjust = -0.4, size = 3) +
+  scale_fill_manual(values = palette_all, guide = "none") +
+  scale_y_continuous(limits = c(0, max(syn_plot$mse) * 1.18),
+                     expand = c(0, 0)) +
+  labs(x = NULL, y = expression(MSE ~ "vs." ~ lambda),
+       title = "(a) Synthetic mixed-scale: MSE vs known truth") +
+  theme_classic(base_size = 10) +
+  theme(plot.title = element_text(size = 11),
+        axis.text.x = element_text(angle = 25, hjust = 1))
+
+paul_plot <- paul_table |>
+  mutate(method = factor(method, levels = levels(syn_plot$method))) |>
+  arrange(method)
+
+p_ari <- ggplot(paul_plot, aes(method, ARI_raw, fill = method)) +
+  geom_col(width = 0.6, colour = "black", linewidth = 0.25) +
+  geom_text(aes(label = sprintf("%.3f", ARI_raw)),
+            vjust = -0.4, size = 3) +
+  scale_fill_manual(values = palette_all, guide = "none") +
+  scale_y_continuous(limits = c(0, max(paul_plot$ARI_raw) * 1.18),
+                     expand = c(0, 0)) +
+  labs(x = NULL, y = "ARI (vs raw clustering)",
+       title = "(b) Paul 2015: cluster preservation") +
+  theme_classic(base_size = 10) +
+  theme(plot.title = element_text(size = 11),
+        axis.text.x = element_text(angle = 25, hjust = 1))
+
+p_auc <- ggplot(paul_plot, aes(method, AUC, fill = method)) +
+  geom_col(width = 0.6, colour = "black", linewidth = 0.25) +
+  geom_hline(yintercept = aucs["raw"], linetype = "dashed",
+             colour = "grey50") +
+  annotate("text", x = 0.6, y = aucs["raw"] + 0.005,
+           label = sprintf("raw = %.3f", aucs["raw"]),
+           hjust = 0, size = 3, colour = "grey30") +
+  geom_text(aes(label = sprintf("%.3f", AUC)),
+            vjust = -0.4, size = 3) +
+  scale_fill_manual(values = palette_all, guide = "none") +
+  coord_cartesian(ylim = c(min(paul_plot$AUC, aucs["raw"]) - 0.02,
+                           max(paul_plot$AUC) + 0.015)) +
+  labs(x = NULL, y = "ROC AUC",
+       title = "(c) Paul 2015: TF-target prediction") +
+  theme_classic(base_size = 10) +
+  theme(plot.title = element_text(size = 11),
+        axis.text.x = element_text(angle = 25, hjust = 1))
+
+fig <- (p_syn | p_ari | p_auc) + plot_layout(widths = c(1, 1, 1))
+
+ggsave(file.path(fig_dir, "fig_per_gene_comparison.png"), fig,
+       width = 10, height = 3.6, dpi = 220, bg = "white")
+
+fig
+```

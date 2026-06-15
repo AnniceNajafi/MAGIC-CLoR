@@ -1,0 +1,229 @@
+---
+title: "Tolerance rule on a sparse UMI trajectory - Tusi 2018 inDrop HSPCs"
+output: html_notebook
+---
+
+The stress test showed the tolerance rule's benefit needs a regime that
+is **sparse AND a differentiation trajectory** (the only place the AUC
+keeps rising past MCV's argmin). Paul 2015 is that regime; the dense 10x
+sets are not, and down-sampling a *discrete* tissue (TM marrow) doesn't
+recreate it (oracle stays t=0). This notebook gives the rule its fairest
+possible shot on a **second, independent** dataset that is both:
+
+* **UMI** (inDrop) - so MCV's Poisson-thinning assumption is valid
+  (unlike Smart-seq2 read counts), and
+* a **continuous HSPC differentiation trajectory** - mouse Kit+ bone
+  marrow progenitors branching into erythroid / myeloid / basophil fates
+  (Tusi et al., *Nature* 2018; GSE89754, `basal_bone_marrow`).
+
+Same mouse hematopoietic TF-target metric as Paul (symbols adjusted to
+this dataset: `Sfpi1`-`Spi1`, `Hbb-b1/2`-`Hbb-bs/bt`). The question:
+
+1. Is the oracle t > 0 here (does smoothing actually help)?
+2. If so, does the tolerance rule track toward it and beat both vanilla
+   MCV and upstream `rmagic_auto` - reproducibly across seeds?
+
+```{r setup, message=FALSE}
+suppressPackageStartupMessages({
+  library(cvMAGIC); library(Rmagic); library(Matrix); library(pROC)
+  library(ggplot2); library(dplyr); library(tidyr); library(patchwork)
+})
+stopifnot(Rmagic::pymagic_is_available())
+fig_dir  <- normalizePath(file.path("..", "figures"), mustWork = FALSE)
+data_dir <- normalizePath(file.path("..", "data"),    mustWork = FALSE)
+out_dir  <- normalizePath(file.path("..", "notebooks"), mustWork = FALSE)
+
+tf_targets <- list(
+  Gata1 = c("Klf1","Hba-a1","Hba-a2","Hbb-bs","Hbb-bt","Aqp1",
+            "Slc4a1","Gypa","Epor"),
+  Gata2 = c("Gata1","Klf1","Itga2b"),
+  Klf1  = c("Hba-a1","Hba-a2","Hbb-bs","Hbb-bt","Aqp1","Slc4a1"),
+  Spi1  = c("Cebpa","Mpo","Csf1r","Csf2ra","Csf2rb"),
+  Cebpa = c("Mpo","Elane","Prtn3","Ctsg","Csf3r"),
+  Cebpe = c("Mpo","Elane","Prtn3","Ctsg"),
+  Gfi1  = c("Csf1r","Elane"),
+  Irf8  = c("Cxcr4"),
+  Tal1  = c("Gata1","Klf1","Gata2"))
+
+score_method <- function(imp_mat, tf_targets, gene_set) {
+  pos <- list(); neg <- list(); set.seed(7L)
+  for (tf in names(tf_targets)) {
+    if (!(tf %in% gene_set)) next
+    targets <- intersect(tf_targets[[tf]], gene_set)
+    if (length(targets) == 0L) next
+    pool <- setdiff(gene_set, c(tf, targets))
+    non_targets <- sample(pool, min(length(pool), 5L * length(targets)))
+    tf_vec <- imp_mat[, tf]
+    cp <- abs(apply(imp_mat[, targets, drop = FALSE], 2, function(g)
+      suppressWarnings(cor(tf_vec, g, method = "spearman"))))
+    cn <- abs(apply(imp_mat[, non_targets, drop = FALSE], 2, function(g)
+      suppressWarnings(cor(tf_vec, g, method = "spearman"))))
+    cp[is.na(cp)] <- 0; cn[is.na(cn)] <- 0
+    pos[[tf]] <- data.frame(score = cp, label = 1L)
+    neg[[tf]] <- data.frame(score = cn, label = 0L)
+  }
+  pairs <- rbind(do.call(rbind, pos), do.call(rbind, neg))
+  list(auc = as.numeric(pROC::roc(pairs$label, pairs$score,
+         levels = c(0L, 1L), direction = "<", quiet = TRUE)$auc),
+       n_pos = sum(pairs$label == 1L), n_neg = sum(pairs$label == 0L))
+}
+
+eval_all <- function(X, tf_targets, t_values = 0:10, t_oracle = 0:15,
+                     npca = 20L, k = 30L, seed = 1L) {
+  gs <- colnames(X); g <- magic_graph(X, npca = npca, k = k)
+  auc_at <- function(t) {
+    imp <- if (t == 0L) X else magic_impute(X, t = t, graph = g)
+    colnames(imp) <- gs; score_method(imp, tf_targets, gs)$auc
+  }
+  curve <- sapply(t_oracle, auc_at); names(curve) <- t_oracle
+  sel <- mcv_select_t(X, t_values = t_values, npca = npca, k = k, seed = seed)
+  t_tol <- sel$t_values[max(which(sel$loss <= min(sel$loss) * 1.05))]
+  rmg <- as.matrix(Rmagic::magic(X, t = "auto", knn = k, npca = npca,
+                                 verbose = 0)$result); colnames(rmg) <- gs
+  list(curve = curve,
+       row = data.frame(
+         t_vanilla = sel$t,  auc_vanilla = curve[as.character(sel$t)],
+         t_tol = t_tol,      auc_tol     = curve[as.character(t_tol)],
+         t_oracle = as.integer(names(which.max(curve))),
+         auc_oracle = max(curve),
+         auc_rmagic = score_method(rmg, tf_targets, gs)$auc,
+         auc_raw = curve["0"], row.names = NULL))
+}
+```
+
+## Load the basal bone-marrow inDrop UMI matrix
+
+CSV is cells x genes with five leading metadata columns
+(`cell_id, barcode, library_id, seq_run_id, pass_filter`).
+
+```{r load, message=FALSE}
+csv <- file.path(data_dir, "GSM2388072_basal_bone_marrow.raw_umifm_counts.csv")
+df <- data.table::fread(csv, sep = ",", header = TRUE, data.table = FALSE)
+meta_cols <- c("cell_id","barcode","library_id","seq_run_id","pass_filter")
+cell_id <- df$cell_id
+M <- as.matrix(df[, setdiff(colnames(df), meta_cols), drop = FALSE])
+rownames(M) <- cell_id
+storage.mode(M) <- "integer"            # raw UMI counts, cells x genes
+rm(df); invisible(gc())
+cat("Raw inDrop matrix:", nrow(M), "cells x", ncol(M), "genes\n")
+cat("Median UMIs/cell:", median(rowSums(M)),
+    "| median genes/cell:", median(rowSums(M > 0)), "\n")
+```
+
+## Build the panel (same protocol as Paul / TM: 1500 cells, 2000 HVG)
+
+```{r panel, message=FALSE}
+build_panel <- function(M, tf_targets, seed = 101L, n_cells = 1500L,
+                        n_genes = 2000L) {
+  libsize <- rowSums(M)
+  keep <- which(libsize >= 1000 & libsize <= quantile(libsize, 0.99))
+  set.seed(seed)
+  ci <- sample(keep, min(n_cells, length(keep)))
+  cn <- M[ci, , drop = FALSE]
+  must_keep <- intersect(unique(c(names(tf_targets), unlist(tf_targets))),
+                         colnames(cn))
+  gpos <- colMeans(cn > 0)
+  cn <- cn[, gpos >= 0.05 | colnames(cn) %in% must_keep, drop = FALSE]
+  gv <- apply(cn, 2, var)
+  hv <- order(gv, decreasing = TRUE)[seq_len(min(n_genes, length(gv)))]
+  keep_genes <- union(colnames(cn)[hv], must_keep)
+  X <- cn[, keep_genes, drop = FALSE]; storage.mode(X) <- "integer"; X
+}
+X0 <- build_panel(M, tf_targets, seed = 101L)
+cat("Panel:", nrow(X0), "cells x", ncol(X0), "genes; median UMI/cell =",
+    median(rowSums(X0)), "\n")
+present <- intersect(names(tf_targets), colnames(X0))
+cat("TFs present:", length(present), "/", length(tf_targets),
+    "(", paste(present, collapse = ","), ")\n")
+sc <- score_method(X0, tf_targets, colnames(X0))
+cat("TF-target pairs:", sc$n_pos, "pos /", sc$n_neg, "neg\n")
+```
+
+## Diagnostic: is this a smoothing-friendly (oracle t > 0) regime?
+
+```{r oracle, message=FALSE}
+e1 <- eval_all(X0, tf_targets, seed = 1L)
+curve_df <- data.frame(t = as.integer(names(e1$curve)), AUC = e1$curve)
+cat("AUC by global t (seed-101 panel):\n"); print(curve_df, row.names = FALSE)
+cat(sprintf("oracle t = %d (AUC %.3f) | vanilla MCV t = %d | tolerant t = %d\n",
+            e1$row$t_oracle, e1$row$auc_oracle, e1$row$t_vanilla, e1$row$t_tol))
+```
+
+## Multi-seed head-to-head: tolerant vs vanilla MCV vs rmagic_auto
+
+```{r seeds, message=FALSE}
+seeds <- 101:106
+rows <- list()
+for (s in seeds) {
+  Xs <- build_panel(M, tf_targets, seed = s)
+  r <- eval_all(Xs, tf_targets, seed = 1L)$row
+  r$seed <- s; rows[[as.character(s)]] <- r
+  cat(sprintf("seed %d | vanilla t=%d(%.3f) tol t=%d(%.3f) oracle t=%d(%.3f) rmagic=%.3f raw=%.3f\n",
+              s, r$t_vanilla, r$auc_vanilla, r$t_tol, r$auc_tol,
+              r$t_oracle, r$auc_oracle, r$auc_rmagic, r$auc_raw))
+}
+res <- do.call(rbind, rows)
+write.csv(res, file.path(out_dir, "tusi_trajectory_results.csv"),
+          row.names = FALSE)
+```
+
+```{r stats}
+g_tv <- res$auc_tol - res$auc_vanilla
+g_tr <- res$auc_tol - res$auc_rmagic
+g_vr <- res$auc_vanilla - res$auc_rmagic
+report <- function(x, lbl) {
+  tt <- tryCatch(t.test(x), error = function(e) NULL)
+  cat(sprintf("%-26s mean=%+.4f sd=%.4f  >0 in %d/%d%s\n", lbl, mean(x),
+      sd(x), sum(x > 0), length(x),
+      if (!is.null(tt) && !is.na(tt$p.value))
+        sprintf("  (p=%.3f, 95%% CI [%+.4f,%+.4f])", tt$p.value,
+                tt$conf.int[1], tt$conf.int[2]) else ""))
+}
+cat("Tusi 2018 basal BM trajectory,", length(seeds), "subsample seeds:\n")
+report(g_tv, "tolerant - vanilla MCV")
+report(g_tr, "tolerant - rmagic_auto")
+report(g_vr, "vanilla  - rmagic_auto")
+cat(sprintf("\nMedian t: vanilla=%g tolerant=%g oracle=%g\n",
+            median(res$t_vanilla), median(res$t_tol), median(res$t_oracle)))
+```
+
+```{r fig, fig.width = 10, fig.height = 4}
+p1 <- ggplot(curve_df, aes(t, AUC)) +
+  geom_line(linewidth = .8, colour = "grey40") +
+  geom_point(size = 2, colour = "grey40") +
+  geom_point(data = subset(curve_df, t == e1$row$t_vanilla),
+             aes(colour = "vanilla argmin"), size = 4) +
+  geom_point(data = subset(curve_df, t == e1$row$t_tol),
+             aes(colour = "tolerant"), size = 3) +
+  geom_point(data = subset(curve_df, t == e1$row$t_oracle),
+             aes(colour = "oracle"), size = 2) +
+  scale_colour_manual(values = c("vanilla argmin" = "#1f77b4",
+    "tolerant" = "#2ca02c", "oracle" = "#d62728"), name = NULL) +
+  scale_x_continuous(breaks = 0:15) +
+  labs(x = "global diffusion t", y = "TF-target AUC",
+       title = "(a) Tusi inDrop: AUC-vs-t and selector landings") +
+  theme_classic(base_size = 10) + theme(legend.position = "bottom")
+
+pl <- res |> select(seed, auc_rmagic, auc_vanilla, auc_tol, auc_oracle) |>
+  pivot_longer(-seed, names_to = "method", values_to = "AUC") |>
+  mutate(method = recode(method, auc_rmagic = "rmagic_auto",
+    auc_vanilla = "cv_mcv (vanilla)", auc_tol = "magic_tolerant",
+    auc_oracle = "oracle"),
+    method = factor(method, levels = c("rmagic_auto","cv_mcv (vanilla)",
+      "magic_tolerant","oracle")))
+p2 <- ggplot(pl, aes(method, AUC, fill = method)) +
+  geom_boxplot(width = .5, outlier.shape = NA, alpha = .5) +
+  geom_jitter(width = .12, size = 1.6, alpha = .8) +
+  scale_fill_manual(values = c("rmagic_auto" = "#ff7f0e",
+    "cv_mcv (vanilla)" = "#1f77b4", "magic_tolerant" = "#2ca02c",
+    "oracle" = "#d62728"), guide = "none") +
+  labs(x = NULL, y = "TF-target AUC",
+       title = sprintf("(b) %d-seed robustness", length(seeds))) +
+  theme_classic(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+fig <- p1 + p2 + plot_layout(widths = c(1.15, 1))
+ggsave(file.path(fig_dir, "fig_tusi_trajectory.png"), fig,
+       width = 10, height = 4.2, dpi = 220, bg = "white")
+fig
+```
