@@ -39,13 +39,13 @@ magic_per_gene <- function(X, t_values = 1:10,
   if (!is.numeric(X) || any(X < 0) || any(X != round(X))) {
     stop("magic_per_gene requires a non-negative integer count matrix.")
   }
+  t_values <- validate_t_values(t_values)
   set.seed(seed)
   sp <- poisson_split(X, split_p)
   A <- sp$A; B <- sp$B
   A_pre <- sqrt(A)
   g_train <- magic_graph(A_pre, npca = npca, k = k, ka = ka, decay = decay)
 
-  t_values <- sort(unique(as.integer(t_values)))
   G <- ncol(X)
   loss_per_gene <- matrix(NA_real_, nrow = length(t_values), ncol = G)
   scale_ab <- (1 - split_p) / split_p
