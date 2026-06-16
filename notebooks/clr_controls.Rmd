@@ -1,11 +1,11 @@
 ---
-title: "MAGIC-CLR airtightness: deployable t, negative-resampling stability, detection-stratified AUC"
+title: "MAGIC-CLR control checks: raw vs CLR at usable t, resampled negatives, detection-stratified AUC"
 output: html_notebook
 ---
 
-The matched-negatives control confirmed CLR beats raw scoring for genuine
-specificity. Three further checks before the result anchors the paper
-(uses the shipped `cvMAGIC::clr_from_cor`):
+The matched-negatives control showed CLR beats raw scoring for real
+specificity. Here are three more checks we run before trusting the result
+(uses `cvMAGIC::clr_from_cor`):
 
 1. **Deployable comparison.** Don't rely on oracle $t$. Report raw vs CLR
    at $t=0$, at the unsupervised `cv_mcv` $t$, at `rmagic_auto`, and at
@@ -121,9 +121,9 @@ for(nm in names(specs)){ sp<-specs[[nm]]; M<-sp$load(); cat(sprintf("\n=== %s ==
   }
   rm(M); invisible(gc()) }
 cur<-do.call(rbind,curve); rmgdf<-do.call(rbind,rmg_rows); stratdf<-do.call(rbind,strat_rows)
-write.csv(cur,file.path(out_dir,"airtight_curve.csv"),row.names=FALSE)
-write.csv(rmgdf,file.path(out_dir,"airtight_rmagic.csv"),row.names=FALSE)
-write.csv(stratdf,file.path(out_dir,"airtight_strat.csv"),row.names=FALSE)
+write.csv(cur,file.path(out_dir,"clr_controls_curve.csv"),row.names=FALSE)
+write.csv(rmgdf,file.path(out_dir,"clr_controls_rmagic.csv"),row.names=FALSE)
+write.csv(stratdf,file.path(out_dir,"clr_controls_strat.csv"),row.names=FALSE)
 ```
 
 ```{r check1-deployable}

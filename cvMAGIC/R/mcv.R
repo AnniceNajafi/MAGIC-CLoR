@@ -136,13 +136,11 @@ mcv_select_t_tolerant <- function(X, t_values = 0:10, tolerance = 0.05,
        split_p = split_p)
 }
 
-#' Convenience end-to-end MAGIC with tolerance-regularised MCV t-selection.
+#' MAGIC with tolerance-regularised MCV t-selection.
 #'
-#' Equivalent to: pick `t` with [mcv_select_t_tolerant()], then run
-#' [magic_impute()] with that t and the train-half graph re-used as the
-#' full graph. This is the "tolerant MAGIC" workflow demonstrated in the
-#' tolerant-MCV benchmark to beat both upstream `rmagic` (t = "auto") and
-#' vanilla `cv_mcv` on TF-target AUC across the Paul 2015 + PBMC 3k pair.
+#' Picks `t` with [mcv_select_t_tolerant()], then runs [magic_impute()] with
+#' that t, re-using the train-half graph as the full graph. This is the
+#' tolerant MAGIC workflow we use in the tolerance benchmark.
 #'
 #' @inheritParams mcv_select_t_tolerant
 #' @return List with `imputed` (cells x genes), `t`, `t_argmin`,

@@ -42,7 +42,7 @@ The exported functions are:
 | <code>magic_modules()</code> | per-module adaptive t |
 | <code>magic_bootstrap_se()</code> | bootstrap per-(cell, gene) standard errors |
 | <code>clr_from_cor()</code> | CLR calibration of any correlation matrix |
-| <code>magic_clr()</code> | end-to-end MAGIC imputation with the CLR readout |
+| <code>magic_clr()</code> | run MAGIC imputation and return the CLR readout |
 
 A minimal example:
 
@@ -51,7 +51,7 @@ library(cvMAGIC)
 
 # X is a cells x genes matrix of raw integer UMI counts
 res <- magic_clr(X, t = 0)   # t = 0 scores CLR on raw counts; t > 0 diffuses first
-clr <- res$clr               # gene-gene CLR association matrix
+clr <- res$assoc             # gene-gene CLR association matrix
 ```
 
 <h2>Reproducing the paper</h2>
@@ -69,7 +69,7 @@ Every notebook runs the real cvMAGIC pipeline (and Rmagic for the upstream compa
 | Bootstrap uncertainty calibration | <code>bootstrap_calibration.Rmd</code> |
 | MAGIC-CLoR positive result (random negatives) | <code>residual_magic.Rmd</code> |
 | MAGIC-CLoR matched-negative control | <code>residual_magic_matched.Rmd</code> |
-| MAGIC-CLoR deployable-t, resampling, and detection-stratified controls | <code>airtight_clr.Rmd</code> |
+| MAGIC-CLoR control checks at usable t, resampling, and detection-stratified AUC | <code>clr_controls.Rmd</code> |
 | External validation on the DoRothEA (A/B) regulons | <code>dorothea_validation.Rmd</code> |
 | Single-dataset fidelity checks | <code>paul_realdata.Rmd</code>, <code>tabula_muris.Rmd</code> |
 

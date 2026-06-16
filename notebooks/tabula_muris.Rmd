@@ -186,7 +186,7 @@ auc_rmagic <- score_method(imp_rmagic, tf_targets, colnames(X))$auc
 van <- mcv_select_t(X, t_values = 0:10, npca = 20L, k = 30L, seed = 1L)
 auc_van <- score_method(impute_at(X, van$t), tf_targets, colnames(X))$auc
 
-# shipped tolerant MCV (eps = 5%)
+#tolerant MCV from the package (eps = 5%)
 tol <- magic_tolerant(X, t_values = 0:10, tolerance = 0.05,
                       npca = 20L, k = 30L, seed = 1L)
 imp_tol <- tol$imputed; colnames(imp_tol) <- colnames(X)
