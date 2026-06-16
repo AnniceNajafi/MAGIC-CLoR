@@ -1,3 +1,49 @@
+#' Validate a Poisson-thinning split probability.
+#'
+#' `split_p` must be a single finite number strictly inside (0, 1): at
+#' `split_p = 0` the rescale `(1 - split_p) / split_p` divides by zero, and
+#' at `split_p = 1` the held-out half `B` is all zeros so the MCV loss
+#' collapses independently of prediction quality. Either boundary (or an
+#' out-of-range value) would let a selector report a confident `t` from an
+#' invalid cross-validation experiment instead of failing fast.
+#'
+#' @param split_p Candidate train-half mass.
+#' @return `split_p` invisibly, if valid; otherwise an error.
+#' @keywords internal
+validate_split_p <- function(split_p) {
+  if (!is.numeric(split_p) || length(split_p) != 1L ||
+      !is.finite(split_p) || split_p <= 0 || split_p >= 1) {
+    stop("split_p must be a single finite number strictly between 0 and 1 ",
+         "(got ", paste(format(split_p), collapse = ", "), ").")
+  }
+  invisible(split_p)
+}
+
+#' Validate and canonicalise a diffusion-time search grid.
+#'
+#' Candidate diffusion times must be non-negative integers (`t = 0` is the
+#' valid "no imputation" option). Negative, non-integer, `NA`, or empty
+#' grids are rejected rather than silently coerced, since the forward sweep
+#' assumes candidates are ordered up from `prev_t = 0`: a negative candidate
+#' would skip the loop entirely and leave the loss attached to an impossible
+#' `t`. Returns the sorted, de-duplicated integer grid.
+#'
+#' @param t_values Candidate diffusion times.
+#' @return Sorted unique integer vector of valid diffusion times.
+#' @keywords internal
+validate_t_values <- function(t_values) {
+  if (!is.numeric(t_values) || length(t_values) == 0L ||
+      any(!is.finite(t_values))) {
+    stop("t_values must be a non-empty numeric vector of finite, ",
+         "non-negative integers.")
+  }
+  if (any(t_values < 0) || any(t_values != round(t_values))) {
+    stop("t_values must be non-negative integers (got ",
+         paste(format(t_values), collapse = ", "), ").")
+  }
+  sort(unique(as.integer(round(t_values))))
+}
+
 #' Poisson-thinning split for molecular cross-validation (Batson et al. 2019).
 #'
 #' For an integer count matrix X, returns two matrices A and B with
@@ -10,6 +56,7 @@
 #' @return List with `A` and `B` matrices.
 #' @keywords internal
 poisson_split <- function(X, split_p = 0.5) {
+  validate_split_p(split_p)
   X <- as.matrix(X)
   storage.mode(X) <- "integer"
   A <- matrix(stats::rbinom(length(X), X, split_p),
@@ -45,6 +92,7 @@ mcv_select_t <- function(X, t_values = 0:10,
     stop("mcv_select_t requires a non-negative integer count matrix. ",
          "Apply MCV before normalisation/sqrt transform.")
   }
+  t_values <- validate_t_values(t_values)
   set.seed(seed)
   sp <- poisson_split(X, split_p = split_p)
   A <- sp$A; B <- sp$B
@@ -52,7 +100,6 @@ mcv_select_t <- function(X, t_values = 0:10,
   A_pre <- sqrt(A)
   g <- magic_graph(A_pre, npca = npca, k = k, ka = ka)
 
-  t_values <- sort(unique(as.integer(t_values)))
   losses <- numeric(length(t_values))
   scale_ab <- (1 - split_p) / split_p
 
