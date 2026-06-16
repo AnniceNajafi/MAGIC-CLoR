@@ -1,28 +1,15 @@
-#' Context Likelihood of Relatedness (CLR) calibration of a correlation matrix.
+#' Apply the CLR (Context Likelihood of Relatedness) transform to a correlation matrix
 #'
-#' Raw gene-gene correlations after graph-diffusion imputation are
-#' confounded: diffusion shares cell-state, lineage, and library-size
-#' structure across neighbours, so many gene pairs co-vary for reasons
-#' unrelated to direct regulation, and highly connected ("hub") genes
-#' correlate with almost everything. The CLR transform (Faith et al.,
-#' \emph{PLoS Biology} 2007) null-calibrates each association against the
-#' background distribution of each gene's correlations:
-#' \deqn{z_i(j) = \max\!\big(0, (C_{ij} - \mu_i)/\sigma_i\big), \quad
-#'       \mathrm{CLR}_{ij} = \sqrt{z_i(j)^2 + z_j(i)^2},}
-#' where \eqn{\mu_i, \sigma_i} are the mean and s.d. of gene \eqn{i}'s row
-#' of \eqn{C}. A pair scores highly only if the two genes are more
-#' correlated than each is \emph{typically} correlated with all genes.
+#' After MAGIC diffusion the gene-gene correlations get inflated, the diffusion
+#' mixes cell state, lineage and library size across neighbor cells so plenty of
+#' pairs end up correlated without being directly related and the hub genes
+#' correlate with almost everything. CLR (Faith et al, PLoS Biology 2007)
+#' rescores each pair against the spread of correlations each gene has with all
+#' the other genes, so a pair only scores high when the two genes are more
+#' correlated with each other than either one usually is with everything else.
 #'
-#' In the cvMAGIC benchmarks, replacing raw \eqn{|\mathrm{corr}|} with
-#' \code{clr_from_cor()} consistently and substantially improves
-#' TF-target recovery across four datasets, and the gain survives
-#' detection/expression-matched negative controls. See
-#' \code{\link{magic_clr}} for the end-to-end wrapper.
-#'
-#' @param C A symmetric gene-by-gene correlation matrix (e.g. from
-#'   \code{stats::cor}). \code{NA}s are treated as 0.
-#' @return A gene-by-gene CLR association matrix (non-negative, symmetric,
-#'   same dimnames as \code{C}).
+#' @param C a symmetric gene by gene correlation matrix, NAs are set to 0
+#' @return a gene by gene CLR association matrix, non-negative and symmetric
 #' @export
 clr_from_cor <- function(C) {
   C <- as.matrix(C)
@@ -30,8 +17,7 @@ clr_from_cor <- function(C) {
   mu  <- rowMeans(C)
   sdv <- apply(C, 1L, stats::sd)
   sdv[!is.finite(sdv) | sdv == 0] <- 1
-  # Column-major recycling makes (C - mu)/sdv operate row-wise:
-  # element [i, j] becomes (C[i, j] - mu[i]) / sdv[i].
+  #column-major recycling makes (C-mu)/sdv go row-wise, so [i,j] becomes (C[i,j]-mu[i])/sdv[i]
   Z  <- (C - mu) / sdv
   Zp <- pmax(Z, 0)
   clr <- sqrt(Zp^2 + t(Zp)^2)
@@ -39,29 +25,22 @@ clr_from_cor <- function(C) {
   clr
 }
 
-#' MAGIC imputation with a CLR-calibrated gene-interaction readout.
+#' Run MAGIC and score the gene pairs with the CLR readout
 #'
-#' Runs MAGIC diffusion at time \code{t} (use \code{t = 0} for no
-#' imputation), computes the gene-gene correlation of the imputed matrix,
-#' and returns both the raw correlation and its CLR-calibrated counterpart
-#' (\code{\link{clr_from_cor}}). The cvMAGIC investigation found that the
-#' dominant limitation for relationship recovery is not the diffusion time
-#' or graph but the \emph{raw-correlation readout}; the CLR association is
-#' the recommended score for ranking gene-gene (e.g. TF-target)
-#' relationships.
+#' Diffuses the data for t steps (set t = 0 to skip the imputation and just
+#' score the raw counts), takes the gene-gene correlation of the result and
+#' returns the raw correlation together with its CLR version. In our tests the
+#' CLR score picks out TF-target pairs better than the plain correlation, so
+#' that is the score we use for ranking gene pairs.
 #'
-#' @param X Integer count matrix, cells x genes (raw UMI counts).
-#' @param t Diffusion time. \code{t = 0} skips imputation (CLR on raw
-#'   counts), which already captures much of the gain; larger \code{t}
-#'   adds value on datasets where diffusion helps.
-#' @param npca,k,ka,decay Graph parameters passed to \code{\link{magic_graph}}.
-#' @param method Correlation method, passed to \code{stats::cor}
-#'   (default \code{"spearman"}).
-#' @param graph Optional precomputed graph from \code{\link{magic_graph}}.
-#' @return List with \code{imputed} (cells x genes), \code{cor} (raw
-#'   gene-gene correlation), \code{assoc} (CLR-calibrated association),
-#'   and \code{t}.
-#' @seealso \code{\link{clr_from_cor}}
+#' @param X integer count matrix, cells x genes (raw UMI counts)
+#' @param t diffusion time, t = 0 skips imputation and scores the raw counts
+#' @param npca,k,ka,decay graph parameters passed to magic_graph
+#' @param method correlation method passed to stats::cor (default "spearman")
+#' @param graph optional precomputed graph from magic_graph
+#' @return a list with imputed (cells x genes), cor (raw correlation), assoc
+#'   (the CLR association) and t
+#' @seealso clr_from_cor
 #' @export
 magic_clr <- function(X, t = 3L, npca = 20L, k = 30L, ka = NULL, decay = 1,
                       method = "spearman", graph = NULL) {

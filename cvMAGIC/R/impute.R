@@ -17,7 +17,7 @@ magic_impute <- function(X, t = 3L, graph = NULL, ...) {
   diffuse(graph$M, X, t)
 }
 
-#' Convenience wrapper: run MAGIC end-to-end with a fixed t.
+#' Build the graph and run MAGIC in one call, with a fixed t.
 #' @inheritParams magic_impute
 #' @param npca Number of principal components for the kNN search.
 #' @param k Number of nearest neighbours per cell.

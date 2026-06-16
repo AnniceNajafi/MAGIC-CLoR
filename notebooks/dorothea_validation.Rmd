@@ -15,7 +15,7 @@ For each TF with >=3 targets present, positives are its DoRothEA targets
 and negatives are non-target genes, evaluated under both random sampling
 and detection/expression matching. We report raw vs CLR oracle AUC and
 deployable-$t$ AUC ($t=0$ and unsupervised \texttt{cv\_mcv} $t$). Uses
-the shipped \texttt{cvMAGIC::clr\_from\_cor}.
+\texttt{cvMAGIC::clr\_from\_cor}.
 
 ```{r setup, message=FALSE}
 suppressPackageStartupMessages({
