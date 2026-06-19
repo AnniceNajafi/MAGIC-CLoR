@@ -23,7 +23,7 @@ install.packages("cvMAGIC", repos = NULL, type = "source")
 
 The package depends on Matrix, RANN, irlba, and stats. Rmagic (and its Python magic-impute backend) is only needed for the notebook cells that compare against the upstream auto-selector.
 
-<h2>The method in one paragraph</h2>
+<h2>Summary of Contribution</h2>
 
 After diffusion, two genes can correlate simply because they ride the same smoothed cell-state manifold (lineage, library size, module activity), so raw correlation mixes direct association with manifold-wide co-expression and hub genes correlate with almost everything. The CLR transform (Faith et al., PLoS Biology 2007) null-calibrates each pair against the background distribution of each gene's correlations, so a pair scores highly only when the two genes are more correlated with each other than each is typically correlated with all genes. CLR has no learned parameters and uses no relationship labels, so it cannot overfit the benchmark.
 
