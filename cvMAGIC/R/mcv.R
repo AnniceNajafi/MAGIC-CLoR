@@ -76,9 +76,8 @@ poisson_split <- function(X, split_p = 0.5) {
 #' @param t_values Candidate diffusion times (non-negative integers).
 #'   Default `0:10` - `t = 0` represents "no imputation", letting MCV
 #'   reject smoothing on datasets where the raw counts already carry
-#'   the structure of interest (e.g. low-dropout 10x). The PBMC 3k
-#'   benchmark shows MCV correctly picks `t = 0` there; the cost on
-#'   high-dropout data (e.g. MARS-seq, Paul 2015) is zero.
+#'   the structure of interest (e.g. low-dropout 10x), letting MCV reject
+#'   smoothing where the raw counts already carry the signal.
 #' @param npca,k,ka Graph parameters passed to `magic_graph`.
 #' @param split_p Train-half mass for Poisson thinning.
 #' @param seed RNG seed for reproducibility.
@@ -136,11 +135,12 @@ mcv_select_t <- function(X, t_values = 0:10,
 #'
 #' `t* = max { t : MCV(t) <= MCV(t_argmin) * (1 + tolerance) }`
 #'
-#' On Paul 2015 (MARS-seq) this picks t=2-3 (AUC 0.977, vs vanilla's
-#' 0.973 at t=1). On PBMC 3k (10x v1) the loss curve rises steeply from
-#' t=0, so the selector stays at t=0 (oracle, AUC 0.856). The default
-#' `tolerance = 0.05` was chosen empirically as the largest value that
-#' does not regress on PBMC 3k.
+#' On sparse trajectory data the rule can push to slightly larger t than the
+#' argmin, but in our benchmarks the resulting AUC change is within sampling
+#' noise and does not generalise across datasets (see the accompanying paper);
+#' it is kept exported as a documented negative result. On dense 10x data the
+#' loss curve rises steeply from t=0, so the selector stays at t=0. The default
+#' `tolerance = 0.05` does not regress on dense data.
 #'
 #' Conceptually this is the inverse-direction sibling of the classical
 #' "1-SE rule" in CV (Hastie, Tibshirani & Friedman 2009, section 7.10): the
@@ -186,7 +186,7 @@ mcv_select_t_tolerant <- function(X, t_values = 0:10, tolerance = 0.05,
 #' MAGIC with tolerance-regularised MCV t-selection.
 #'
 #' Picks `t` with [mcv_select_t_tolerant()], then runs [magic_impute()] with
-#' that t, re-using the train-half graph as the full graph. This is the
+#' that t on a graph rebuilt from the full data. This is the
 #' tolerant MAGIC workflow we use in the tolerance benchmark.
 #'
 #' @inheritParams mcv_select_t_tolerant

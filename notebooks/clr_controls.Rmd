@@ -1,5 +1,5 @@
 ---
-title: "MAGIC-CLR control checks: raw vs CLR at usable t, resampled negatives, detection-stratified AUC"
+title: "MAGIC-CLoR control checks: raw vs CLR at usable t, resampled negatives, detection-stratified AUC"
 output: html_notebook
 ---
 
@@ -173,7 +173,7 @@ plotdf<-dep|>transmute(dataset, `t=0`=clr_t0-raw_t0, `cv_mcv`=clr_mcv-raw_mcv,
 fig<-ggplot(plotdf,aes(setting,gain,fill=setting))+geom_col(width=.7,colour="black",linewidth=.2)+
   geom_hline(yintercept=0,linewidth=.3)+facet_wrap(~dataset,nrow=1)+
   scale_fill_brewer(palette="Set2",guide="none")+
-  labs(x=NULL,y="CLR - raw AUC gain",title="MAGIC-CLR gain over raw scoring at deployable t settings (matched negatives)")+
+  labs(x=NULL,y="CLR - raw AUC gain",title="MAGIC-CLoR gain over raw scoring at deployable t settings (matched negatives)")+
   theme_classic(base_size=10)+theme(axis.text.x=element_text(angle=25,hjust=1))
 ggsave(file.path(fig_dir,"fig_airtight_clr.png"),fig,width=10,height=4,dpi=220,bg="white")
 fig

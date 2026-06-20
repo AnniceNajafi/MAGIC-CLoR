@@ -10,8 +10,10 @@
 #' published paper describes a Gaussian kernel with bandwidth set to the
 #' ka-th neighbour; pass `decay = 2` and `ka < k` to use that variant.
 #'
-#' @param X Numeric matrix of cells (rows) by genes (columns). Should be
-#'   library-size normalised and sqrt or log transformed before calling.
+#' @param X Numeric matrix of cells (rows) by genes (columns). The graph is
+#'   built directly on the supplied values; the deployed `magic_clr` pipeline
+#'   passes raw counts, while molecular cross-validation passes the
+#'   square-root-stabilised training half.
 #' @param npca Number of principal components to use for the kNN search.
 #' @param k Number of nearest neighbours per cell.
 #' @param ka Bandwidth neighbour index. If `NULL` (default) use `k`, matching

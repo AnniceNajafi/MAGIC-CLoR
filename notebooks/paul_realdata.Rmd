@@ -19,7 +19,7 @@ We report two of the three metrics named in the Discussion:
    compute ROC AUC.
 
 The third metric named in the article, FACS-protein correlation, is
-**not applicable**: Paul 2015 used a SMART-seq protocol with no paired
+**not applicable**: Paul 2015 used a MARS-seq protocol with no paired
 FACS protein measurements per cell.
 
 ```{r setup, message=FALSE}

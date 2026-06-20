@@ -7,8 +7,10 @@
 magic_graph(X, npca = 20L, k = 30L, ka = NULL, decay = 1)
 }
 \arguments{
-\item{X}{Numeric matrix of cells (rows) by genes (columns). Should be
-library-size normalised and sqrt or log transformed before calling.}
+\item{X}{Numeric matrix of cells (rows) by genes (columns). The graph is
+built directly on the supplied values; the deployed `magic_clr` pipeline
+passes raw counts, while molecular cross-validation passes the
+square-root-stabilised training half.}
 
 \item{npca}{Number of principal components to use for the kNN search.}
 

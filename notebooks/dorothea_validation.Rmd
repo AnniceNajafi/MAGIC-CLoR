@@ -1,5 +1,5 @@
 ---
-title: "MAGIC-CLR external validation on DoRothEA (A/B) regulons"
+title: "MAGIC-CLoR external validation on DoRothEA (A/B) regulons"
 output: html_notebook
 ---
 
@@ -140,7 +140,7 @@ fig<-ggplot(long,aes(setting,gain,fill=setting))+geom_col(width=.7,colour="black
   geom_hline(yintercept=0,linewidth=.3)+facet_wrap(~dataset,nrow=1)+
   scale_fill_brewer(palette="Set2",guide="none")+
   labs(x=NULL,y="CLR - raw AUC gain",
-       title="MAGIC-CLR on DoRothEA A/B regulons (matched negatives), by deployable t setting")+
+       title="MAGIC-CLoR on DoRothEA A/B regulons (matched negatives), by deployable t setting")+
   theme_classic(base_size=10)+theme(axis.text.x=element_text(angle=25,hjust=1))
 ggsave(file.path(fig_dir,"fig_dorothea.png"),fig,width=9,height=4,dpi=220,bg="white")
 fig

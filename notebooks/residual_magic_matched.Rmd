@@ -3,8 +3,8 @@ title: "ResidualMAGIC control: does CLR still win with detection/expression-MATC
 output: html_notebook
 ---
 
-The CLR scoring beat raw $|\mathrm{Spearman}|$ on all 4 datasets / 12
-seeds. The remaining loophole: the benchmark's negatives were *random*
+The CLR scoring beat raw $|\mathrm{Spearman}|$ on all 4 datasets / 20
+dataset-seed combinations. The remaining loophole: the benchmark's negatives were *random*
 non-targets, so CLR might be exploiting a systematic detection/expression
 difference between targets and non-targets rather than true regulatory
 specificity. This notebook closes it: each true target is paired with 5
@@ -13,7 +13,7 @@ positives and negatives have (nearly) identical marginals. If CLR still
 beats raw, the gain reflects specificity, not a marginal confound.
 
 Everything else is identical to `residual_magic.Rmd` (same imputation,
-t grid, oracle-per-scoring, 3 seeds).
+t grid, oracle-per-scoring, 5 seeds).
 
 ```{r setup, message=FALSE}
 suppressPackageStartupMessages({

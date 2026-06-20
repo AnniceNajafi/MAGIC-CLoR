@@ -1,10 +1,12 @@
 #' Knee-point selection of MAGIC's diffusion time (van Dijk et al., Fig S1C).
 #'
-#' Implements the original heuristic from the MAGIC paper: compute the
-#' Procrustes / Frobenius change between successive imputations,
-#' delta(t) = || M^t X - M^(t-1) X ||_F / || M^(t-1) X ||_F, and pick the
+#' Diffusion-time selection by the relative Frobenius change between
+#' successive imputations,
+#' delta(t) = || M^t X - M^(t-1) X ||_F / || M^(t-1) X ||_F, picking the
 #' t at which delta(t) drops below a small fractional threshold (the "knee").
-#' This is the reference baseline that cvMAGIC's MCV-based selection replaces.
+#' This is a rotation-free simplification of the Procrustes disparity used by
+#' the upstream MAGIC auto-selection; it serves as cvMAGIC's reference
+#' baseline that MCV-based selection replaces.
 #'
 #' @param X cells x genes data matrix (pre-transformed, e.g. sqrt(counts)).
 #' @param t_max Maximum diffusion time to consider.

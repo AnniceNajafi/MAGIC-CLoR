@@ -6,7 +6,7 @@
 \usage{
 mcv_select_t(
   X,
-  t_values = 1:10,
+  t_values = 0:10,
   npca = 20L,
   k = 30L,
   ka = 5L,
@@ -17,7 +17,11 @@ mcv_select_t(
 \arguments{
 \item{X}{Integer count matrix, cells x genes.}
 
-\item{t_values}{Candidate diffusion times (positive integers).}
+\item{t_values}{Candidate diffusion times (non-negative integers).
+Default `0:10` - `t = 0` represents "no imputation", letting MCV
+reject smoothing on datasets where the raw counts already carry
+the structure of interest (e.g. low-dropout 10x), letting MCV reject
+smoothing where the raw counts already carry the signal.}
 
 \item{npca, k, ka}{Graph parameters passed to `magic_graph`.}
 

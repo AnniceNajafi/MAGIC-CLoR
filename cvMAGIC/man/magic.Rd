@@ -2,7 +2,7 @@
 % Please edit documentation in R/impute.R
 \name{magic}
 \alias{magic}
-\title{Convenience wrapper: run MAGIC end-to-end with a fixed t.}
+\title{Build the graph and run MAGIC in one call, with a fixed t.}
 \usage{
 magic(X, t = 3L, npca = 20L, k = 30L, ka = 5L)
 }
@@ -24,5 +24,5 @@ neighbour).}
 Imputed cells x genes matrix.
 }
 \description{
-Convenience wrapper: run MAGIC end-to-end with a fixed t.
+Build the graph and run MAGIC in one call, with a fixed t.
 }

@@ -25,7 +25,7 @@ The package depends on Matrix, RANN, irlba, and stats. Rmagic (and its Python ma
 
 <h2>Summary of Contribution</h2>
 
-After diffusion, two genes can correlate simply because they ride the same smoothed cell-state manifold (lineage, library size, module activity), so raw correlation mixes direct association with manifold-wide co-expression and hub genes correlate with almost everything. The CLR transform (Faith et al., PLoS Biology 2007) null-calibrates each pair against the background distribution of each gene's correlations, so a pair scores highly only when the two genes are more correlated with each other than each is typically correlated with all genes. CLR has no learned parameters and uses no relationship labels, so it cannot overfit the benchmark.
+After diffusion, two genes can correlate simply because they ride the same smoothed cell-state manifold (lineage, library size, module activity), so raw correlation mixes direct association with manifold-wide co-expression and hub genes correlate with almost everything. The CLR transform (Faith et al., PLoS Biology 2007) null-calibrates each pair against the background distribution of each gene's correlations, so a pair scores highly only when the two genes are more correlated with each other than each is typically correlated with all genes. CLR has no learned parameters and uses no relationship labels, so it has no fitted benchmark parameters (though selecting CLR after observing benchmark results remains a study-level choice).
 
 <h2>Usage</h2>
 
@@ -71,6 +71,7 @@ Every notebook runs the real cvMAGIC pipeline (and Rmagic for the upstream compa
 | MAGIC-CLoR matched-negative control | <code>residual_magic_matched.Rmd</code> |
 | MAGIC-CLoR control checks at usable t, resampling, and detection-stratified AUC | <code>clr_controls.Rmd</code> |
 | External validation on the DoRothEA (A/B) regulons | <code>dorothea_validation.Rmd</code> |
+| Readout-gain decomposition (calibration vs sign-handling) and per-TF macro AUC | <code>sign_ablation.R</code> |
 | Single-dataset fidelity checks | <code>paul_realdata.Rmd</code>, <code>tabula_muris.Rmd</code> |
 
 Run order: install cvMAGIC, then from the <code>notebooks/</code> folder render <code>paper_benchmark.Rmd</code> first (it processes all four datasets identically), then the rest. Figures are written to <code>../figures/</code>.
