@@ -4,6 +4,7 @@
 #' aggregate. Used internally by `magic_modules`.
 #'
 #' @inheritParams mcv_select_t
+#' @param t_values Candidate diffusion times (default `1:10`).
 #' @return List with `graph`, `t_values`, `loss_per_gene` (rows = t_values,
 #'   cols = genes).
 #' @keywords internal

@@ -11,7 +11,7 @@ magic(X, t = 3L, npca = 20L, k = 30L, ka = 5L)
 is recommended). Must be the same matrix used for graph construction OR a
 compatible matrix of identical row count.}
 
-\item{t}{Diffusion time (positive integer). If NULL, defaults to 3.}
+\item{t}{Diffusion time (non-negative integer; default 3).}
 
 \item{npca}{Number of principal components for the kNN search.}
 

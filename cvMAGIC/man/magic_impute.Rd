@@ -11,7 +11,7 @@ magic_impute(X, t = 3L, graph = NULL, ...)
 is recommended). Must be the same matrix used for graph construction OR a
 compatible matrix of identical row count.}
 
-\item{t}{Diffusion time (positive integer). If NULL, defaults to 3.}
+\item{t}{Diffusion time (non-negative integer; default 3).}
 
 \item{graph}{Optional pre-computed graph from `magic_graph()`. If NULL, one is
 built from X.}

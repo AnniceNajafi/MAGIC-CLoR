@@ -1,13 +1,15 @@
 Package: cvMAGIC
-Title: Cross-Validated, Per-Module-Adaptive MAGIC with Bootstrap Uncertainty
+Title: MAGIC-CLoR: Calibrated Association Scoring after MAGIC Diffusion
 Version: 0.0.0.9000
 Author: Annice Najafi [aut, cre]
 Maintainer: Annice Najafi <annicenajafi27@gmail.com>
 Description: Native R implementation of MAGIC (Markov Affinity-based Graph
-    Imputation of Cells, van Dijk et al. 2018) with three additions: (1)
-    Batson-style molecular cross-validation to select the diffusion time
-    objectively, (2) per-gene-module adaptive diffusion time to mitigate
-    over-smoothing, and (3) bootstrap-based per-(cell, gene) standard errors.
+    Imputation of Cells, van Dijk et al. 2018) together with MAGIC-CLoR, a
+    parameter-free Context Likelihood of Relatedness (CLR) calibration of the
+    post-diffusion correlation readout that improves transcription-factor
+    target recovery. Also provides Batson-style molecular cross-validation for
+    diffusion-time selection, per-gene and per-module adaptive variants, and
+    bootstrap per-(cell, gene) standard errors.
 License: MIT + file LICENSE
 Encoding: UTF-8
 Imports:
