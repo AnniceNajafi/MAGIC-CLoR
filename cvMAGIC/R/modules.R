@@ -1,13 +1,14 @@
 #' MCV losses per gene across a diffusion-time sweep.
 #'
 #' Like `mcv_select_t` but returns a t x gene loss matrix rather than the
-#' aggregate. Used internally by `magic_modules`.
+#' aggregate. Used by `magic_modules` and `magic_per_gene`, and exposed
+#' directly so the per-(t, gene) loss surface can be inspected.
 #'
 #' @inheritParams mcv_select_t
 #' @param t_values Candidate diffusion times (default `1:10`).
 #' @return List with `graph`, `t_values`, `loss_per_gene` (rows = t_values,
 #'   cols = genes).
-#' @keywords internal
+#' @export
 mcv_per_gene <- function(X, t_values = 1:10,
                          npca = 20L, k = 30L, ka = NULL, decay = 1,
                          split_p = 0.5, seed = 1L) {

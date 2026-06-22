@@ -38,6 +38,7 @@ The exported functions are:
 | <code>knee_select_t()</code> | the original knee-point heuristic for choosing t |
 | <code>mcv_select_t()</code> | molecular cross-validation choice of t |
 | <code>mcv_select_t_tolerant()</code>, <code>magic_tolerant()</code> | tolerance-regularised MCV |
+| <code>mcv_per_gene()</code> | per-(t, gene) MCV loss surface (the per-gene/per-module building block) |
 | <code>magic_per_gene()</code> | per-gene adaptive t |
 | <code>magic_modules()</code> | per-module adaptive t |
 | <code>magic_bootstrap_se()</code> | bootstrap per-(cell, gene) standard errors |
